@@ -1,0 +1,49 @@
+{
+  "name": "@cioffi_ai/opencode-memory",
+  "version": "1.1.0",
+  "description": "Local-first persistent memory for OpenCode using a WRITE → DREAM → SURFACE lifecycle.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": "./dist/index.js",
+  "files": [
+    "dist",
+    "commands",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external \"@opencode-ai/plugin\"",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run test && bun run build",
+    "prepublishOnly": "bun run check"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "memory",
+    "persistent-memory",
+    "local-first",
+    "coding-agent",
+    "long-term-memory"
+  ],
+  "author": "Antonio Cioffi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cioffiAI/opencode-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cioffiAI/opencode-memory/issues"
+  },
+  "homepage": "https://github.com/cioffiAI/opencode-memory#readme",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
