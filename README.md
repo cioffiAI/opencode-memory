@@ -1,6 +1,6 @@
 # opencode-memory
 
-<video src="docs/demo.mp4" controls muted></video>
+<video src="https://github.com/user-attachments/assets/85ac2f6c-5662-4517-966a-639b7c319b81" controls muted></video>
 
 Local-first persistent memory for OpenCode.
 
