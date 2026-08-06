@@ -1,5 +1,7 @@
 # opencode-memory
 
+<video src="docs/demo.mp4" controls muted></video>
+
 Local-first persistent memory for OpenCode.
 
 opencode-memory gives OpenCode durable memory across sessions through a
