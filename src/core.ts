@@ -12,10 +12,37 @@ export type Entry = {
   created: number
   lastSeen: number
   source: "explicit" | "dreamed"
+  // Provenance (v2): where a memory comes from, so every fact is auditable.
+  createdBy?: "memory_write" | "memory_update" | "consolidation"
+  sourceSessionID?: string
+  sourceMessageIDs?: string[]
+  extractedAt?: number
+  confidence?: number
+  // Tier (v2): core is always surfaced, archival only on relevance,
+  // temporary expires, pinned never decays. Legacy entries are derived
+  // from the category during migration (see normalizeStore).
+  tier?: "core" | "archival" | "temporary"
+  pinned?: boolean
+  expiresAt?: number
+  // Lifecycle (v2): explicit memories that the consolidation contradicts
+  // are marked CONFLICTED (never silently overwritten); user resolution
+  // brings them back to ACTIVE; replaced ones become SUPERSEDED tombstones.
+  status?: "ACTIVE" | "CONFLICTED" | "SUPERSEDED"
+  conflictEvidence?: string
+  conflictAt?: number
+  supersededAt?: number
+  // Usage feedback (v2): how the memory performed in retrieval.
+  useCount?: number
+  lastUsed?: number
+  helpfulCount?: number
+  irrelevantCount?: number
+  // Privacy (v2): local-only facts are never surfaced to remote providers
+  // nor included in consolidation prompts.
+  sensitivity?: "normal" | "private" | "local-only"
 }
 
 export type Store = {
-  version: 1
+  version: 2
   summary: string
   updatedAt: number
   entries: Entry[]
@@ -29,22 +56,46 @@ export const DAY = 24 * 60 * 60 * 1000
 export const CATEGORIES = ["user", "project", "workflow", "preferences", "decisions", "status", "environment", "other"]
 
 export function emptyStore(): Store {
-  return { version: 1, summary: "", updatedAt: 0, entries: [] }
+  return { version: 2, summary: "", updatedAt: 0, entries: [] }
 }
 
+// Legacy stores (version 1) are migrated in place: unknown categories fall
+// back to "other", and each entry gets its tier, status and sensitivity
+// defaults derived from what v1 already encoded.
 export function normalizeStore(store: Store): Store {
-  if (store.version !== 1) return emptyStore()
+  const v = (store as { version?: unknown }).version
+  if (v !== 1 && v !== 2) return emptyStore()
+  store.version = 2
   for (const e of store.entries) {
-    if (e.category === "general") e.category = "other"
-    if (!CATEGORIES.includes(e.category)) e.category = "other"
+    if (e.category === "general" || !CATEGORIES.includes(e.category)) e.category = "other"
+    if (!e.tier) e.tier = CORE_CATEGORIES.has(e.category) ? "core" : "archival"
+    if (!e.status) e.status = "ACTIVE"
+    if (!e.sensitivity) e.sensitivity = "normal"
   }
   return store
 }
 
+// Time-based decay is applied HERE and nowhere else. weight is a static
+// importance baseline (raised on refresh, never decayed in place): the score
+// of an entry therefore depends only on how much time has passed, never on
+// how many times prune() happened to run.
 export function score(entry: Entry, t = Date.now()): number {
+  if (entry.pinned === true) {
+    const sourceBonusPinned = entry.source === "explicit" ? 0.5 : 0
+    return entry.weight + sourceBonusPinned + utilizationBonus(entry)
+  }
   const days = Math.max(0, (t - entry.lastSeen) / DAY)
   const sourceBonus = entry.source === "explicit" ? 0.5 : 0
-  return (entry.weight + sourceBonus) * Math.exp(-days / 45)
+  return (entry.weight + sourceBonus + utilizationBonus(entry)) * Math.exp(-days / 45)
+}
+
+// Usage feedback modulates the score: memories that proved helpful rank
+// higher and are forgotten later; memories marked irrelevant rank lower.
+// Both bonuses saturate to keep the scale bounded.
+export function utilizationBonus(entry: Entry): number {
+  const helpful = Math.min(5, entry.helpfulCount ?? 0) * 0.1
+  const irrelevant = Math.min(5, entry.irrelevantCount ?? 0) * 0.15
+  return Math.max(-0.5, helpful - irrelevant)
 }
 
 export function norm(text: string): string {
@@ -118,19 +169,43 @@ export function addEntry(store: Store, e: Omit<Entry, "id" | "created"> & { crea
 }
 
 export function prune(store: Store, t = Date.now(), maxEntries = 400) {
-  for (const e of store.entries) e.weight *= Math.exp(-(t - e.lastSeen) / 45 / DAY)
+  // Never mutate weight here: decay is applied exclusively in score().
+  // Entries below the floor are removed (their score is a function of time
+  // alone, so removal is deterministic regardless of prune frequency).
+  // SUPERSEDED tombstones are dropped after a short grace period so the
+  // "forgot" history stays queryable for a while without accumulating.
+  store.entries = store.entries.filter((e) => {
+    if (e.status === "SUPERSEDED") {
+      const supersededAt = e.supersededAt ?? e.lastSeen
+      return t - supersededAt < 30 * DAY
+    }
+    if (e.expiresAt !== undefined && e.expiresAt <= t) return false
+    return score(e, t) >= 0.15
+  })
   store.entries.sort((a, b) => score(b, t) - score(a, t))
-  store.entries = store.entries.filter((e) => e.weight >= 0.15).slice(0, maxEntries)
+  store.entries = store.entries.slice(0, maxEntries)
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
+export type ConsolidationSource = {
+  sessionID?: string
+  messageIDs?: string[]
+}
+
 export function applyConsolidation(
   store: Store,
-  parsed: { new?: any[]; update?: any[]; delete?: string[]; summary?: string },
+  parsed: {
+    new?: any[]
+    update?: any[]
+    delete?: string[]
+    summary?: string
+    conflicts?: { id?: string; evidence?: string }[]
+  },
   projectID: string | undefined,
   t = Date.now(),
   log?: (level: LogLevel, message: string, extra?: Record<string, unknown>) => void,
+  source?: ConsolidationSource,
 ) {
   for (const item of parsed.new ?? []) {
     if (!item || typeof item.text !== "string" || !item.text.trim()) continue
@@ -138,6 +213,8 @@ export function applyConsolidation(
     const scope: Entry["scope"] = item.scope === "project" ? "project" : "global"
     const category = typeof item.category === "string" && CATEGORIES.includes(item.category) ? item.category : "other"
     const existing = findSimilar(store.entries, text, 0.5)
+    const confidence =
+      typeof item.confidence === "number" && item.confidence >= 0 && item.confidence <= 1 ? item.confidence : undefined
     if (existing) {
       // Source hierarchy: explicit (user-stated) always wins. Never
       // duplicate or rewrite it from an inference.
@@ -148,6 +225,10 @@ export function applyConsolidation(
       existing.text = text
       existing.weight = Math.min(4, existing.weight + 0.5)
       existing.lastSeen = t
+      existing.createdBy = "consolidation"
+      existing.sourceSessionID = source?.sessionID ?? existing.sourceSessionID
+      existing.extractedAt = t
+      if (confidence !== undefined) existing.confidence = confidence
       if (scope === "project" && !existing.projectID) existing.projectID = projectID
     } else {
       // Topic-level guard: same category + shared content word → treat as
@@ -168,6 +249,11 @@ export function applyConsolidation(
         lastSeen: t,
         source: "dreamed",
         created: t,
+        createdBy: "consolidation",
+        sourceSessionID: source?.sessionID,
+        sourceMessageIDs: source?.messageIDs,
+        extractedAt: t,
+        confidence,
       })
     }
   }
@@ -179,14 +265,36 @@ export function applyConsolidation(
       target.text = item.text.trim()
       target.weight = Math.min(4, target.weight + 0.5)
       target.lastSeen = t
+      target.extractedAt = t
+      target.sourceSessionID = source?.sessionID ?? target.sourceSessionID
     }
   }
   for (const item of parsed.delete ?? []) {
     if (typeof item !== "string") continue
     const del = item.trim()
-    store.entries = store.entries.filter(
-      (e) => e.source === "explicit" || (e.id !== del && !(del.length > 3 && e.text.toLowerCase().includes(del.toLowerCase()))),
-    )
+    const target = store.entries.find((e) => e.id === del)
+    if (target && target.source !== "explicit") {
+      // Dreamed entries are never hard-deleted by consolidation: they become
+      // SUPERSEDED tombstones (auditable, pruned after the grace period).
+      target.status = "SUPERSEDED"
+      target.supersededAt = t
+    } else {
+      store.entries = store.entries.filter(
+        (e) => e.source === "explicit" || (e.id !== del && !(del.length > 3 && e.text.toLowerCase().includes(del.toLowerCase()))),
+      )
+    }
+  }
+  // Contradiction reporting: an explicit entry the conversation conflicts
+  // with is flagged, never silently overwritten. The user (or the agent on
+  // their behalf) resolves it via memory_update / memory_write.
+  for (const c of parsed.conflicts ?? []) {
+    if (!c || typeof c.id !== "string") continue
+    const target = store.entries.find((e) => e.id === c.id)
+    if (!target) continue
+    const evidence = typeof c.evidence === "string" ? c.evidence.slice(0, 500) : ""
+    target.status = "CONFLICTED"
+    target.conflictEvidence = evidence || "contradicted in a later conversation"
+    target.conflictAt = t
   }
   if (typeof parsed.summary === "string" && parsed.summary.trim()) {
     store.summary = parsed.summary.trim().slice(0, 3000)
@@ -255,4 +363,81 @@ export function expandTopicKeywords(keywords: string[]): string[] {
     }
   }
   return [...out]
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval pipeline
+// ---------------------------------------------------------------------------
+
+export const KEYWORD_BONUS = 3
+
+export type RankedMemory = {
+  entry: Entry
+  // base: pure time/weight score, before any relevance bonus.
+  base: number
+  // keywordHits: how many expanded topic keywords matched the memory text.
+  keywordHits: number
+  // core: the memory was selected through its core tier slot, not relevance.
+  core: boolean
+  // rank: 1-based final position within the candidate window.
+  rank: number
+  // final: total ordering score (base + keyword bonus).
+  final: number
+}
+
+export type RetrieveOptions = {
+  // Excluded sensitivity levels: entries with these values are never
+  // returned (surface excludes "local-only"; memory_read excludes none).
+  excludeSensitivity?: Set<Entry["sensitivity"]>
+  // Candidate window handed to the (optional) semantic reranker.
+  candidateCount?: number
+}
+
+// Lexical stage of the hybrid pipeline: scope filter + expanded-keyword
+// relevance + time/weight score. Returns the top candidate window, sorted,
+// each item carrying the breakdown needed to explain WHY it ranked there.
+export function retrieve(
+  store: Store,
+  directory: string | undefined,
+  query: string,
+  t = Date.now(),
+  opts: RetrieveOptions = {},
+): RankedMemory[] {
+  const window = opts.candidateCount ?? 30
+  const expanded = expandTopicKeywords(topicKeywords(query))
+  const candidates = store.entries.filter(
+    (e) =>
+      e.status !== "SUPERSEDED" &&
+      (e.expiresAt === undefined || e.expiresAt > t) &&
+      (e.scope === "global" || (e.scope === "project" && e.projectID === directory)) &&
+      !(opts.excludeSensitivity && e.sensitivity && opts.excludeSensitivity.has(e.sensitivity)),
+  )
+  const ranked = candidates.map((e) => {
+    const et = norm(e.text)
+    const hits = expanded.length === 0 ? 0 : expanded.filter((k) => et.includes(k) || e.category === k).length
+    const base = score(e, t)
+    return { entry: e, base, keywordHits: hits, core: false, rank: 0, final: base + hits * KEYWORD_BONUS }
+  })
+  ranked.sort((a, b) => b.final - a.final)
+  const top = ranked.slice(0, window)
+  top.forEach((r, i) => (r.rank = i + 1))
+  return top
+}
+
+// Core-slot selection: core-tier memories that did NOT rank via relevance
+// are injected anyway (operative preferences always available), newest first,
+// up to maxCore. CONFLICTED entries are kept visible so they can be resolved.
+export function coreSlot(store: Store, directory: string | undefined, exclude: Set<string>, t = Date.now(), maxCore = 3): Entry[] {
+  return store.entries
+    .filter(
+      (e) =>
+        e.status !== "SUPERSEDED" &&
+        e.tier === "core" &&
+        (e.expiresAt === undefined || e.expiresAt > t) &&
+        (e.scope === "global" || (e.scope === "project" && e.projectID === directory)) &&
+        e.sensitivity !== "local-only" &&
+        !exclude.has(e.id),
+    )
+    .sort((a, b) => score(b, t) - score(a, t))
+    .slice(0, maxCore)
 }

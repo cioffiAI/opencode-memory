@@ -5,16 +5,16 @@ import path from "path"
 import {
   addEntry,
   applyConsolidation,
-  CORE_CATEGORIES,
+  coreSlot,
+  DAY,
   emptyStore,
-  expandTopicKeywords,
   findSimilar,
+  KEYWORD_BONUS,
   norm,
   normalizeStore,
   prune,
+  retrieve,
   score,
-  tokens,
-  topicKeywords,
 } from "./core.ts"
 
 // ---------------------------------------------------------------------------
@@ -42,6 +42,18 @@ const CONFIG = {
   sweepBatch: Number(process.env.OPENCODE_MEMORY_SWEEP_BATCH ?? 8),
   gcChildAgeMs: Number(process.env.OPENCODE_MEMORY_GC_CHILD_AGE_MS ?? 10 * 60 * 1000),
   inProgressTimeoutMs: Number(process.env.OPENCODE_MEMORY_INPROGRESS_TIMEOUT_MS ?? 10 * 60 * 1000),
+  // Hybrid retrieval: optional semantic reranking stage. Off by default;
+  // when enabled it reranks the lexical candidate window through a headless
+  // LLM call, cached per query and bounded by a timeout that falls back to
+  // the lexical order on any delay.
+  rerank: process.env.OPENCODE_MEMORY_RERANK === "1",
+  rerankCandidates: Number(process.env.OPENCODE_MEMORY_RERANK_CANDIDATES ?? 30),
+  rerankTimeoutMs: Number(process.env.OPENCODE_MEMORY_RERANK_TIMEOUT_MS ?? 4000),
+  rerankCacheMs: Number(process.env.OPENCODE_MEMORY_RERANK_CACHE_MS ?? 60 * 1000),
+  coreSlot: Number(process.env.OPENCODE_MEMORY_CORE_SLOT ?? 3),
+  // Surface feedback: lastSeen/useCount of surfaced memories are persisted
+  // at most once per entry per interval, to avoid IO on every prompt.
+  surfaceRefreshMs: Number(process.env.OPENCODE_MEMORY_SURFACE_REFRESH_MS ?? 15 * 60 * 1000),
 }
 
 const DATA_DIR =
@@ -53,6 +65,7 @@ const LOCK_FILE = path.join(DATA_DIR, ".lock")
 
 type Entry = import("./core.ts").Entry
 type Store = import("./core.ts").Store
+type RankedMemory = import("./core.ts").RankedMemory
 
 type InProgress = {
   targetTs: number
@@ -389,11 +402,20 @@ async function consolidate(sessionID: string): Promise<void> {
     .join("\n\n")
     .slice(-CONFIG.transcriptChars)
 
+  const messageIDs = messages
+    .filter((m: any) => m?.id || m?.info?.id)
+    .map((m: any) => String(m?.id ?? m?.info?.id))
+    .slice(-20)
+
   const store = await getStore()
+  // local-only facts never leave the machine: they are excluded from the
+  // consolidation prompt (the transcript itself is still processed by the
+  // provider, as documented in the README).
+  const visible = store.entries.filter((e) => e.sensitivity !== "local-only")
   const entriesBlock =
-    store.entries.length === 0
+    visible.length === 0
       ? "(none)"
-      : store.entries
+      : visible
           .map((e) => `- [${e.id}] (${e.scope}/${e.category}, w=${e.weight.toFixed(1)}, source=${e.source}) ${e.text}`)
           .join("\n")
 
@@ -403,14 +425,14 @@ TASKS:
 1. new: facts about the user (preferences, constraints, personal details, decisions, project state) that are NOT already in memory. Be concise, third person ("The user...").
 2. update: only entries whose fact genuinely CHANGED in the conversation (e.g. "The user changed jobs" replaces the old one). Never use update for mere reformulation.
 3. delete: ids of entries that are outdated or contradicted.
-4. summary: 2-5 sentence summary of who the user is and how they like to work.
+4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit (the user says something that invalidates it, e.g. "I always use npm" vs "from now on I use Bun everywhere"), report it here with the entry id and a short evidence quote. Never modify or delete that entry — reporting is enough; the user resolves the conflict.
+5. summary: 2-5 sentence summary of who the user is and how they like to work.
 
 SOURCE HIERARCHY (critical):
 - Entries tagged source=explicit were stated directly by the user and ALWAYS win over source=dreamed (inferred) ones.
 - NEVER add a "new" fact that is semantically equivalent to an explicit entry. Equivalence is BROAD: same meaning in ANY language, different wording, or paraphrase — e.g. "The user likes green" == "L'utente preferisce il verde", "the user codes in Rust" == "all'utente piace programmare in Rust", "the user prefers Rust" == "the user uses Rust".
 - ANY fact about the same user attribute/topic as an existing entry (same preference, skill, habit, constraint, decision) is a DUPLICATE, regardless of wording or language. Only add a new fact when it describes a DIFFERENT attribute.
-- NEVER delete or update explicit entries, even when the conversation contradicts them.
-- A contradiction with an explicit entry must be IGNORED COMPLETELY: never add it as a "new" fact AND never mention it in the summary. The summary is injected into every future conversation, so mentioning the conflict there would reintroduce it through the back door.
+- NEVER delete or update explicit entries, even when the conversation contradicts them: use the "conflicts" task instead.
 - If a "new" fact duplicates a DREAMED entry, put the old dreamed entry's id in "delete" and the better formulation in "new" — exactly one entry survives.
 - If a dreamed entry contradicts an explicit one, put the dreamed entry's id in "delete".
 
@@ -421,9 +443,10 @@ RULES:
 - Write facts in the same language the user used in the conversation.
 - Existing entries may be written in a DIFFERENT language: compare MEANING, not wording. Before adding a fact, ask yourself "does any existing entry already state this?" — if yes, it is a duplicate.
 - scope "project" ONLY for facts tied to this specific codebase; everything else "global".
+- Optionally attach "confidence" (0-1) to each new fact: how sure the conversation supports it.
 
 RESPOND WITH STRICT JSON ONLY. No markdown fences, no commentary, nothing before or after:
-{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project"}],"update":[{"id":"...","text":"..."}],"delete":["..."],"summary":"..."}
+{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}],"summary":"..."}
 
 CURRENT MEMORY ENTRIES:
 ${entriesBlock}
@@ -470,7 +493,10 @@ ${transcript}`
 
     await withLock(async () => {
       const fresh = await readStore()
-      applyConsolidation(fresh, parsed, session.directory, now(), log)
+      applyConsolidation(fresh, parsed, session.directory, now(), log, {
+        sessionID,
+        messageIDs,
+      })
       prune(fresh, now(), CONFIG.maxEntries)
       await writeStore(fresh)
     })
@@ -565,18 +591,115 @@ async function sweep() {
 // Memory block injection (proactive surfacing)
 // ---------------------------------------------------------------------------
 
-async function sessionTopicKeywords(client: any, sessionID: string): Promise<string[]> {
+const RERANK_TITLE = "memory-surfacing"
+
+// Last retrieval snapshot per session, for the inspector's "surfaced" view.
+const lastSurface = new Map<string, RankedMemory[]>()
+const rerankCache = new Map<string, { at: number; order: string[] }>()
+
+async function sessionTopicQuery(client: any, sessionID: string): Promise<string> {
   try {
     const res = await client.session.messages({ path: { id: sessionID }, query: { limit: 8 } })
     const msgs: any[] = res?.data ?? []
     const lastUser = [...msgs].reverse().find((m) => m?.info?.role === "user")
-    const text = (lastUser?.parts ?? [])
+    return (lastUser?.parts ?? [])
       .filter((p: any) => p?.type === "text")
       .map((p: any) => p.text)
       .join(" ")
-    return topicKeywords(text)
   } catch {
-    return []
+    return ""
+  }
+}
+
+// Optional semantic stage of the hybrid pipeline: a headless LLM call reranks
+// the lexical candidate window. Cached per query, bounded by a timeout that
+// falls back to the lexical order, and disabled by default.
+async function rerankCandidates(
+  client: any,
+  sessionID: string,
+  query: string,
+  candidates: RankedMemory[],
+): Promise<RankedMemory[]> {
+  if (candidates.length <= 1) return candidates
+  const key = norm(query || " ")
+  const cached = rerankCache.get(key)
+  if (cached && now() - cached.at < CONFIG.rerankCacheMs) {
+    return applyRerankOrder(candidates, cached.order)
+  }
+  let childID: string | undefined
+  try {
+    const created = await client.session.create({ body: { title: RERANK_TITLE, parentID: sessionID } })
+    childID = created?.data?.id
+    if (!childID) return candidates
+    consolidationIDs.add(childID)
+    const lines = candidates.map((r, i) => `[${i}] ${r.entry.text}`).join("\n")
+    const prompt = `You are a memory retrieval reranker. Rank the candidate memories by relevance to the user question, most relevant first. Use semantics, not just keywords: paraphrase and synonyms count. Reorder ALL candidates. REPLY WITH STRICT JSON ONLY: {"order":[0,2,1,...]}
+
+QUESTION: ${query || "(empty)"}
+
+CANDIDATES:
+${lines}`
+    await client.session.promptAsync({
+      path: { id: childID },
+      body: { parts: [{ type: "text", text: prompt }], tools: DISABLED_TOOLS },
+    })
+    const answer = await Promise.race([
+      waitForReply(client, childID, 90_000, { after: Date.now() }),
+      sleep(CONFIG.rerankTimeoutMs).then(() => ""),
+    ])
+    if (!answer) return candidates
+    const parsed = extractJson(answer)
+    const order = Array.isArray(parsed?.order)
+      ? parsed.order.map(Number).filter((i: number) => Number.isInteger(i) && i >= 0 && i < candidates.length)
+      : []
+    if (order.length === 0) return candidates
+    const ids = order.map((i: number) => candidates[i].entry.id)
+    rerankCache.set(key, { at: now(), order: ids })
+    return applyRerankOrder(candidates, ids)
+  } catch {
+    return candidates
+  } finally {
+    if (childID) {
+      consolidationIDs.delete(childID)
+      await clientRef.session.delete({ path: { id: childID } }).catch(() => {})
+    }
+  }
+}
+
+function applyRerankOrder(candidates: RankedMemory[], order: string[]): RankedMemory[] {
+  const pos = new Map(order.map((id, i) => [id, i]))
+  return [...candidates].sort((a, b) => {
+    const pa = pos.get(a.entry.id)
+    const pb = pos.get(b.entry.id)
+    if (pa === undefined && pb === undefined) return b.base - a.base
+    if (pa === undefined) return 1
+    if (pb === undefined) return -1
+    return pa - pb
+  })
+}
+
+// Persist surface feedback (lastUsed/useCount/lastSeen) at most once per
+// entry per interval: surfaced memories stay alive through exposure without
+// writing the store on every prompt.
+async function markSurfaced(ids: string[], t = now()) {
+  if (ids.length === 0) return
+  try {
+    await withLock(async () => {
+      const s = await readStore()
+      let changed = false
+      for (const id of ids) {
+        const e = s.entries.find((x) => x.id === id)
+        if (!e) continue
+        if (t - (e.lastUsed ?? 0) < CONFIG.surfaceRefreshMs) continue
+        e.lastUsed = t
+        e.useCount = (e.useCount ?? 0) + 1
+        e.lastSeen = t
+        changed = true
+      }
+      if (changed) await writeStore(s)
+    })
+  } catch (err) {
+    log("debug", "markSurfaced failed", { error: String(err) })
   }
 }
 
@@ -587,30 +710,39 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
   const directory = session?.directory
   const t = now()
 
-  const candidates = store.entries.filter(
-    (e) => e.scope === "global" || (e.scope === "project" && e.projectID === directory),
-  )
-  const keywords = await sessionTopicKeywords(client, sessionID)
-  const expanded = expandTopicKeywords(keywords)
-  log("debug", "surface topic", { sessionID, keywords: keywords.slice(0, 12), expanded: expanded.slice(0, 12) })
-
-  const ranked = candidates
-    .map((e) => {
-      if (expanded.length === 0) return { e, relevance: 0 }
-      const et = norm(e.text)
-      const hits = expanded.filter((k) => et.includes(k) || e.category === k).length
-      return { e, relevance: hits }
-    })
-    .sort((a, b) => score(b.e, t) + b.relevance * 3 - (score(a.e, t) + a.relevance * 3))
-    .slice(0, CONFIG.maxFacts)
-    .map((x) => x.e)
-
-  const selected = new Set(ranked.map((e) => e.id))
-  const core = candidates
-    .filter((e) => CORE_CATEGORIES.has(e.category) && !selected.has(e.id))
-    .sort((a, b) => score(b, t) - score(a, t))
-    .slice(0, 3)
-  const entries = ranked.length < CONFIG.maxFacts ? [...ranked, ...core] : ranked
+  const query = await sessionTopicQuery(client, sessionID)
+  const ranked = retrieve(store, directory, query, t, {
+    excludeSensitivity: new Set(["local-only"]),
+    candidateCount: CONFIG.rerankCandidates,
+  })
+  const reranked = CONFIG.rerank ? await rerankCandidates(client, sessionID, query, ranked) : ranked
+  // Relevance floor: without RERANK, only keyword-qualified memories enter
+  // the relevance tier — a query that matches nothing surfaces nothing but
+  // the core slot (no noise for off-topic prompts).
+  const qualified = CONFIG.rerank ? reranked : reranked.filter((r) => r.keywordHits > 0)
+  const top = qualified.slice(0, CONFIG.maxFacts)
+  const selectedIds = new Set(top.map((r) => r.entry.id))
+  const core = coreSlot(store, directory, selectedIds, t, CONFIG.coreSlot)
+  const surfaced: RankedMemory[] = [
+    ...top,
+    ...core.map((e, i) => ({
+      entry: e,
+      base: score(e, t),
+      keywordHits: 0,
+      core: true,
+      rank: top.length + i + 1,
+      final: score(e, t),
+    })),
+  ]
+  lastSurface.set(sessionID, surfaced)
+  log("debug", "surface ranked", {
+    sessionID,
+    query: query.slice(0, 80),
+    candidates: ranked.length,
+    qualified: qualified.length,
+    surfaced: surfaced.length,
+  })
+  void markSurfaced(surfaced.map((r) => r.entry.id), t)
 
   const lines: string[] = []
   lines.push("<memory>")
@@ -618,10 +750,12 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
   if (store.summary) {
     lines.push(`<summary>${store.summary}</summary>`)
   }
-  if (entries.length > 0) {
+  if (surfaced.length > 0) {
     lines.push("<facts>")
-    for (const e of entries) {
-      lines.push(`- [${e.source}] (${e.category}) ${e.text}`)
+    for (const r of surfaced) {
+      const e = r.entry
+      const status = e.status === "CONFLICTED" ? ", conflicted" : ""
+      lines.push(`- [${e.source}] (${e.category}${status}) ${e.text}`)
     }
     lines.push("</facts>")
   }
@@ -722,16 +856,28 @@ export default async ({ client }: { client: any }) => {
 
       memory_write: tool({
         description:
-          "Store a durable fact about the user or the project in long-term memory so future sessions remember it (like ChatGPT's 'remember that...'). Use for preferences, constraints, personal details, project decisions, and status that should persist.",
+          "Store a durable fact about the user or the project in long-term memory so future sessions remember it (like ChatGPT's 'remember that...'). Use for preferences, constraints, personal details, project decisions, and status that should persist. If a CONFLICTED memory is rewritten here it is resolved.",
         args: {
           fact: tool.schema.string().describe("The fact to remember, third person about the user, e.g. 'The user prefers TypeScript over JavaScript'"),
           category: tool.schema.string().optional().describe("Optional category: user, project, workflow, preferences, decisions, status, environment, other"),
           scope: tool.schema.enum(["global", "project"]).optional().describe("'global' applies everywhere; 'project' only in this codebase (default global)"),
+          tier: tool.schema.enum(["core", "archival", "temporary"]).optional().describe("core: always surfaced; archival: surfaced on relevance (default for non-critical facts); temporary: expires automatically"),
+          ttlHours: tool.schema.number().optional().describe("Lifetime in hours for tier=temporary (default 24)"),
+          pinned: tool.schema.boolean().optional().describe("If true the memory never decays (e.g. identity facts)"),
+          sensitivity: tool.schema.enum(["normal", "private", "local-only"]).optional().describe("local-only: never surfaced to remote providers nor sent during consolidation; only visible through memory_read"),
         },
         async execute(args, ctx) {
           const text = String(args.fact ?? "").trim()
           if (!text) return "No fact provided."
           const scope: Entry["scope"] = args.scope === "project" ? "project" : "global"
+          const tier: Entry["tier"] = args.tier === "temporary" || args.tier === "archival" || args.tier === "core" ? args.tier : undefined
+          const sensitivity: Entry["sensitivity"] =
+            args.sensitivity === "private" || args.sensitivity === "local-only" ? args.sensitivity : undefined
+          const expiresAt =
+            tier === "temporary"
+              ? now() + Number(args.ttlHours ?? 24) * 60 * 60 * 1000
+              : undefined
+          let status = ""
           await withLock(async () => {
             const fresh = await readStore()
             const existing = findSimilar(fresh.entries, text)
@@ -740,8 +886,21 @@ export default async ({ client }: { client: any }) => {
               existing.source = "explicit"
               existing.weight = Math.min(4, existing.weight + 0.5)
               existing.lastSeen = now()
+              existing.createdBy = "memory_write"
+              existing.confidence = 1
+              if (tier) existing.tier = tier
+              if (existing.tier !== "temporary") existing.expiresAt = undefined
+              if (args.pinned === true) existing.pinned = true
+              if (args.pinned === false) existing.pinned = false
+              if (sensitivity) existing.sensitivity = sensitivity
               if (args.category) existing.category = String(args.category)
               if (scope === "project" && !existing.projectID) existing.projectID = ctx.directory
+              if (existing.status === "CONFLICTED") {
+                existing.status = "ACTIVE"
+                existing.conflictEvidence = undefined
+                existing.conflictAt = undefined
+                status = " (conflict resolved)"
+              }
             } else {
               addEntry(fresh, {
                 text,
@@ -752,19 +911,25 @@ export default async ({ client }: { client: any }) => {
                 lastSeen: now(),
                 source: "explicit",
                 created: now(),
+                createdBy: "memory_write",
+                confidence: 1,
+                tier: tier ?? (String(args.category ?? "other") === "other" ? "archival" : "core"),
+                pinned: args.pinned === true ? true : undefined,
+                expiresAt,
+                sensitivity: sensitivity ?? "normal",
               })
             }
             fresh.updatedAt = now()
             prune(fresh, now(), CONFIG.maxEntries)
             await writeStore(fresh)
           })
-          return `Remembered (${scope}): ${text}`
+          return `Remembered (${scope})${status}: ${text}`
         },
       }),
 
       memory_update: tool({
         description:
-          "Correct an existing memory entry (e.g. the user changed jobs, moved, or a preference changed). Provide either id (from memory_read) or match text; the new fact replaces the old one.",
+          "Correct an existing memory entry (e.g. the user changed jobs, moved, or a preference changed). Provide either id (from memory_read) or match text; the new fact replaces the old one. Resolves a CONFLICTED entry.",
         args: {
           id: tool.schema.string().optional().describe("Entry id from memory_read"),
           match: tool.schema.string().optional().describe("Text of the entry to update"),
@@ -774,6 +939,7 @@ export default async ({ client }: { client: any }) => {
           const fact = String(args.fact ?? "").trim()
           if (!fact) return "No fact provided."
           let updated = 0
+          let resolvedConflict = false
           await withLock(async () => {
             const fresh = await readStore()
             const target = args.id
@@ -785,12 +951,208 @@ export default async ({ client }: { client: any }) => {
               target.text = fact
               target.weight = Math.min(4, target.weight + 0.5)
               target.lastSeen = now()
+              if (target.status === "CONFLICTED") {
+                target.status = "ACTIVE"
+                target.conflictEvidence = undefined
+                target.conflictAt = undefined
+                resolvedConflict = true
+              }
               updated = 1
             }
             fresh.updatedAt = now()
             await writeStore(fresh)
           })
-          return updated ? `Updated: ${fact}` : "No matching entry found."
+          return updated ? `Updated: ${fact}${resolvedConflict ? " (conflict resolved)" : ""}` : "No matching entry found."
+        },
+      }),
+
+      memory_why: tool({
+        description:
+          "Explain where a memory entry comes from: provenance (session, messages, extraction time, confidence), lifecycle status and score breakdown. Use when the user asks why a memory exists or whether it can be trusted.",
+        args: {
+          id: tool.schema.string().describe("Entry id from memory_read"),
+        },
+        async execute(args) {
+          const store = await getStore()
+          const e = store.entries.find((x) => x.id === args.id)
+          if (!e) return "No memory entry with this id."
+          const t = now()
+          const days = Math.max(0, (t - e.lastSeen) / DAY)
+          const decay = Math.exp(-days / 45)
+          const base = score(e, t)
+          const lines: string[] = []
+          lines.push(`Text: ${e.text}`)
+          lines.push(`Source: ${e.source}${e.createdBy ? ` (via ${e.createdBy})` : ""}`)
+          lines.push(`Category: ${e.category} | Scope: ${e.scope}${e.projectID ? ` | project: ${e.projectID}` : ""}`)
+          if (e.source === "dreamed") {
+            lines.push(`Extracted: ${e.extractedAt ? new Date(e.extractedAt).toISOString() : "unknown"}`)
+            if (e.sourceSessionID) lines.push(`From session: ${e.sourceSessionID}`)
+            if (e.sourceMessageIDs?.length) lines.push(`From messages: ${e.sourceMessageIDs.join(", ")}`)
+            if (e.confidence !== undefined) lines.push(`Confidence: ${(e.confidence * 100).toFixed(0)}%`)
+          } else {
+            lines.push(`Stated directly by the user (${e.created ? new Date(e.created).toISOString() : "date unknown"})`)
+          }
+          lines.push(
+            `Lifecycle: ${e.status ?? "ACTIVE"}${e.pinned ? " | pinned (no decay)" : ""}${e.tier ? ` | tier ${e.tier}` : ""}${
+              e.expiresAt ? ` | expires ${new Date(e.expiresAt).toISOString()}` : ""
+            }`,
+          )
+          if (e.status === "CONFLICTED") {
+            lines.push(`Conflict: flagged on ${e.conflictAt ? new Date(e.conflictAt).toISOString() : "?"}`)
+            lines.push(`Evidence: ${e.conflictEvidence ?? "—"}`)
+            lines.push("Resolve it with memory_update (new fact) or memory_write (rewrite).")
+          }
+          lines.push(`Weight: ${e.weight.toFixed(2)} (base importance, never decayed in place)`)
+          lines.push(`Usage: surfaced ${e.useCount ?? 0}x, helpful ${e.helpfulCount ?? 0}, irrelevant ${e.irrelevantCount ?? 0}`)
+          lines.push(
+            `Score (now): ${base.toFixed(3)} = (${e.weight.toFixed(2)} + source bonus + utilization) × decay ${decay.toFixed(3)} (age ${Math.round(days)}d)`,
+          )
+          for (const [sid, ranked] of lastSurface) {
+            const hit = ranked.find((r) => r.entry.id === e.id)
+            if (hit) {
+              lines.push(`Last surfacing (session ${sid}):`)
+              lines.push(`  Base score: ${hit.base.toFixed(2)}`)
+              lines.push(`  Keyword match: ${hit.keywordHits > 0 ? `+${hit.keywordHits * KEYWORD_BONUS} (${hit.keywordHits} hits)` : "+0"}`)
+              lines.push(`  Core slot: ${hit.core ? "yes" : "no"}`)
+              lines.push(`  Final rank: #${hit.rank}`)
+            }
+          }
+          lines.push(`Sensitivity: ${e.sensitivity ?? "normal"}`)
+          return lines.join("\n")
+        },
+      }),
+
+      memory_inspect: tool({
+        description:
+          "Inspect the memory store: stats (counts by source/scope/tier/status, context cost), recent entries, conflicts awaiting resolution, project-scoped entries, or the 'why surfaced' breakdown of the current session's retrieval.",
+        args: {
+          show: tool.schema.enum(["stats", "recent", "conflicts", "project", "surfaced"]).optional().describe("View to show (default stats)"),
+          limit: tool.schema.number().optional().describe("Max entries in list views (default 10)"),
+        },
+        async execute(args, ctx) {
+          const store = await getStore()
+          const show = args.show ?? "stats"
+          const limit = Math.max(1, Math.min(50, Number(args.limit ?? 10)))
+          const out: string[] = []
+          if (show === "stats") {
+            const s = store
+            const explicit = s.entries.filter((e) => e.source === "explicit").length
+            const dreamed = s.entries.filter((e) => e.source === "dreamed").length
+            const global = s.entries.filter((e) => e.scope === "global").length
+            const project = s.entries.filter((e) => e.scope === "project").length
+            const core = s.entries.filter((e) => e.tier === "core").length
+            const archival = s.entries.filter((e) => e.tier === "archival").length
+            const temporary = s.entries.filter((e) => e.tier === "temporary").length
+            const pinned = s.entries.filter((e) => e.pinned).length
+            const conflicted = s.entries.filter((e) => e.status === "CONFLICTED").length
+            const superseded = s.entries.filter((e) => e.status === "SUPERSEDED").length
+            const localOnly = s.entries.filter((e) => e.sensitivity === "local-only").length
+            const privateCount = s.entries.filter((e) => e.sensitivity === "private").length
+            const avgChars = s.entries.length ? Math.round(s.entries.reduce((a, e) => a + e.text.length, 0) / s.entries.length) : 0
+            const catCounts = new Map<string, number>()
+            for (const e of s.entries) catCounts.set(e.category, (catCounts.get(e.category) ?? 0) + 1)
+            out.push("OpenCode Memory")
+            out.push("")
+            out.push(`Stored: ${s.entries.length}   Explicit: ${explicit}   Dreamed: ${dreamed}`)
+            out.push(`Global: ${global}   Project: ${project}`)
+            out.push(`Tier: core ${core} | archival ${archival} | temporary ${temporary} | pinned ${pinned}`)
+            out.push(`Status: conflicted ${conflicted} | superseded (tombstones) ${superseded}`)
+            out.push(`Sensitivity: local-only ${localOnly} | private ${privateCount}`)
+            out.push(`Categories: ${[...catCounts.entries()].map(([c, n]) => `${c} ${n}`).join(", ")}`)
+            out.push(`Summary: ${s.summary.length} chars   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((s.summary.length + s.entries.reduce((a, e) => a + e.text.length, 0)) / 4)} tokens`)
+            const totalSurface = [...lastSurface.values()].reduce((a, r) => a + r.length, 0)
+            out.push(`Surfaced in last prompts: ${totalSurface}/${s.entries.length}`)
+          } else if (show === "recent") {
+            const list = [...store.entries].sort((a, b) => b.created - a.created).slice(0, limit)
+            out.push(`Recent ${list.length} entries:`)
+            for (const e of list) {
+              out.push(`- [${e.id}] (${e.scope}/${e.category}, ${e.source}${e.status === "CONFLICTED" ? ", conflicted" : ""}) ${e.text}`)
+            }
+          } else if (show === "conflicts") {
+            const list = store.entries.filter((e) => e.status === "CONFLICTED")
+            if (list.length === 0) {
+              out.push("No conflicts awaiting resolution.")
+            } else {
+              out.push(`${list.length} conflicted explicit memor${list.length === 1 ? "y" : "ies"} (resolve with memory_update):`)
+              for (const e of list) {
+                out.push(`- [${e.id}] ${e.text}`)
+                out.push(`  evidence: ${e.conflictEvidence ?? "—"} (flagged ${e.conflictAt ? new Date(e.conflictAt).toISOString() : "?"})`)
+              }
+            }
+          } else if (show === "project") {
+            const dir = ctx.directory
+            const list = store.entries.filter((e) => e.scope === "project").slice(0, limit)
+            out.push(`Project entries (directory: ${dir ?? "unknown"}) — ${list.length}/${store.entries.filter((e) => e.scope === "project").length}:`)
+            for (const e of list) {
+              out.push(`- [${e.id}] (${e.category}, ${e.source}) ${e.text}`)
+            }
+          } else if (show === "surfaced") {
+            const sid = ctx.sessionID ?? ""
+            const ranked = lastSurface.get(sid)
+            if (!ranked || ranked.length === 0) {
+              out.push("No memory surfaced for this session yet. Send a message to trigger retrieval.")
+            } else {
+              out.push(`Why was this memory surfaced? (session ${sid}, latest retrieval)`)
+              out.push("")
+              for (const r of ranked) {
+                const e = r.entry
+                out.push(`Memory: "${e.text}"`)
+                out.push(`  Base score:      ${r.base.toFixed(2)}`)
+                out.push(`  Keyword match:   ${r.keywordHits > 0 ? `+${(r.keywordHits * KEYWORD_BONUS).toFixed(2)} (${r.keywordHits} hits)` : "+0.00"}`)
+                out.push(`  Core bonus:      ${r.core ? "yes" : "no"}`)
+                out.push(`  Final rank:      #${r.rank}`)
+                out.push("")
+              }
+            }
+          }
+          return out.join("\n")
+        },
+      }),
+
+      memory_useful: tool({
+        description: "Tell the memory system that a surfaced memory was actually useful. Improves its future ranking and slows its decay.",
+        args: {
+          id: tool.schema.string().describe("Entry id from memory_read"),
+        },
+        async execute(args) {
+          let ok = false
+          await withLock(async () => {
+            const fresh = await readStore()
+            const target = fresh.entries.find((e) => e.id === args.id)
+            if (target) {
+              target.helpfulCount = (target.helpfulCount ?? 0) + 1
+              target.useCount = (target.useCount ?? 0) + 1
+              target.lastUsed = now()
+              target.lastSeen = now()
+              ok = true
+            }
+            fresh.updatedAt = now()
+            await writeStore(fresh)
+          })
+          return ok ? "Noted as useful." : "No memory entry with this id."
+        },
+      }),
+
+      memory_irrelevant: tool({
+        description: "Tell the memory system that a surfaced memory was NOT relevant to the current task. Lowers its future ranking.",
+        args: {
+          id: tool.schema.string().describe("Entry id from memory_read"),
+        },
+        async execute(args) {
+          let ok = false
+          await withLock(async () => {
+            const fresh = await readStore()
+            const target = fresh.entries.find((e) => e.id === args.id)
+            if (target) {
+              target.irrelevantCount = (target.irrelevantCount ?? 0) + 1
+              target.useCount = (target.useCount ?? 0) + 1
+              target.lastUsed = now()
+              ok = true
+            }
+            fresh.updatedAt = now()
+            await writeStore(fresh)
+          })
+          return ok ? "Noted as irrelevant." : "No memory entry with this id."
         },
       }),
 
