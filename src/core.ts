@@ -206,15 +206,24 @@ export function consolidationEntries(store: Store, directory: string | undefined
 
 // In-place rewrite target for memory_write: restricted to the SAME scope (and
 // same project for scope=project). A global fact and an equivalent project
-// fact may coexist by design; neither suppresses the other.
+// fact may coexist by design; neither suppresses the other. Normal writes
+// never target local-only entries (they are invisible); a write that is
+// ITSELF local-only may refresh a previous local-only entry so repeated
+// writes do not accumulate duplicates.
 export function findWritableTarget(
   entries: Entry[],
   text: string,
   scope: Entry["scope"],
   directory: string | undefined,
   threshold = 0.6,
+  includeLocalOnly = false,
 ): Entry | undefined {
-  const candidates = entries.filter((e) => !isLocalOnly(e) && e.scope === scope && (scope === "global" || e.projectID === directory))
+  const candidates = entries.filter(
+    (e) =>
+      (includeLocalOnly || !isLocalOnly(e)) &&
+      e.scope === scope &&
+      (scope === "global" || e.projectID === directory),
+  )
   return findSimilar(candidates, text, threshold)
 }
 

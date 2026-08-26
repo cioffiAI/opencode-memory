@@ -753,8 +753,10 @@ export default async ({ client }: { client: any }) => {
             const fresh = await getStore()
             // Rewrite targeting is scoped: a write can only refresh an entry
             // in the SAME scope (and same project). Cross-scope equivalents
-            // coexist by design; local-only entries are never rewrite targets.
-            const existing = findWritableTarget(fresh.entries, text, scope, ctx.directory)
+            // coexist by design. Normal writes never target local-only
+            // entries; a local-only write may refresh a previous local-only
+            // one (prevents duplicate accumulation without exposing them).
+            const existing = findWritableTarget(fresh.entries, text, scope, ctx.directory, 0.6, sensitivity === "local-only")
             if (existing) {
               existing.text = text
               existing.source = "explicit"

@@ -122,9 +122,16 @@ describe("findWritableTarget (memory_write dedup targeting)", () => {
     expect(findWritableTarget(store.entries, "The user prefers Bun as runtime.", "global", undefined)?.id).toBe("g-bun")
   })
 
-  test("never targets local-only entries", () => {
+  test("never targets local-only entries from a normal write", () => {
     const store = storeWith([entry({ id: "lo", text: "The user prefers Bun as runtime.", sensitivity: "local-only" })])
     expect(findWritableTarget(store.entries, "The user prefers Bun as runtime.", "global", undefined)).toBeUndefined()
+  })
+
+  test("a local-only write MAY refresh a previous local-only entry (no duplicate accumulation)", () => {
+    const store = storeWith([entry({ id: "lo", text: "The user's SMTP password is hunter2.", sensitivity: "local-only" })])
+    expect(
+      findWritableTarget(store.entries, "The user's SMTP password is now CorrectHorse.", "global", undefined, 0.6, true)?.id,
+    ).toBe("lo")
   })
 })
 

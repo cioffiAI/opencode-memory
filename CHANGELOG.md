@@ -3,6 +3,85 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.1] — 2026-08-26
+
+Trust-boundaries hardening release. No new features; every change tightens an
+existing guarantee.
+
+### Fixed
+
+- **Project isolation enforced end-to-end.** `memory_read` previously returned
+  project-scoped entries of ALL projects (no directory filter); the `project`
+  inspector view listed other projects' entries; `memory_clear(scope="project")`
+  deleted every project's memories, not just the current project's;
+  `memory_update` / `memory_forget` / feedback tools could mutate another
+  project's entries by id or text match. All lookups now go through a single
+  visibility policy (`readableEntries` / `readQuery` / `clearProjectEntries` in
+  `core.ts`): global + current project only. Regression-tested with two
+  distinct directories plus global entries.
+- **DREAM cross-project contamination.** Consolidation dedup searched the whole
+  store: a fact extracted in project A could refresh/rewrite project B's
+  dreamed entry, be suppressed by B's explicit entry via similarity or topic
+  clash, or update/supersede/flag entries it was never shown. All consolidation
+  lookups are now restricted to the consolidating session's visible set.
+- **`memory_write` rewrite targeting.** A write with an explicit scope could
+  overwrite a semantically similar entry from a DIFFERENT scope/project;
+  rewrite-dedup is now same-scope + same-project only (global and equivalent
+  project facts coexist by design).
+- **Relevance gate silently defeated.** The word "user" (and "utente") was not
+  in the retrieval stopword list while nearly every stored fact contains it, so
+  any query mentioning "user" matched every entry and the keyword relevance
+  gate introduced in 1.5.0 never actually gated anything. Found by the new
+  falsifiable benchmark (negative-query FP rate dropped from 76.3% to 39.5%
+  after the fix, Recall unchanged at 100%).
+
+### Changed
+
+- **Surfacing no longer refreshes recency.** Automatic exposure used to bump
+  `lastSeen`, letting frequently surfaced memories stay artificially fresh
+  (a self-reinforcing retrieval loop, immortal under pruning). Exposure is now
+  recorded separately (`lastSurfaced`, `surfacedCount`) and never affects the
+  score; only explicit confirmation (`memory_useful`, writes,
+  consolidation refreshes) resets decay. Negative feedback never touches
+  recency.
+- **Semantic reranker can abstain.** With `OPENCODE_MEMORY_RERANK=1` the
+  reranker may answer `{"order":[]}` when no candidate answers the question;
+  abstention surfaces nothing beyond the core slot instead of forcing a
+  ranking. Unparseable output still falls back to the deterministic lexical
+  order. Rerank orphan children are now garbage-collected like consolidation
+  ones.
+- **Falsifiable benchmark.** `bench/run.ts` rewritten around a pure harness:
+  the old "false-surface rate" counted unsupported surfacing AFTER the keyword
+  gate had already filtered those entries (0.0% by construction). The suite now
+  has 38 negative scenarios across six categories that can genuinely fail
+  (clean no-match, hard lexical negatives, semantic distractors, cross-language
+  collisions, project-isolation negatives, core-only queries) and reports
+  separately candidate quality (Recall@5, MRR), surface precision, false-
+  positive / abstention rate and context overhead. Positive scenarios are
+  unchanged.
+
+### Security
+
+- **DREAM child sessions run with zero tools.** The headless consolidation,
+  semantic-dedup and rerank sessions previously disabled only the five memory
+  tools by name — shell, filesystem, network fetch, MCP and subagent tools
+  remained available to a session processing untrusted conversation text.
+  They are now created with a single wildcard denial (`tools: {"*": false}`),
+  verified against OpenCode server source v1.18.0–v1.18.20 to remove the
+  entire toolset from the model-visible request (allow-none). Crash recovery,
+  orphan GC and at-least-once semantics are unchanged. A contract test pins
+  the deny-all shape so per-tool enumerations cannot creep back.
+- **Honest `local-only` privacy contract.** The previous claim "never leave
+  the machine" was not enforceable: `memory_read` returned local-only entries
+  as tool output (which reaches the provider), and the DREAM dedup prompt
+  included them among existing entries. Local-only entries are now excluded
+  from EVERY model-visible path: SURFACE injection, DREAM entries and dedup
+  prompts, rerank candidates, all tool responses (`memory_read`,
+  `memory_why`, `memory_inspect`) and all mutating tools. The documented
+  access path is direct human inspection of `OPENCODE_MEMORY_DIR`; remaining
+  limitations (the write call itself, prior transcript exposure, summary
+  generation by the provider) are documented in the README threat model.
+
 ## [1.5.0] — 2026-08-11
 
 ### Added
