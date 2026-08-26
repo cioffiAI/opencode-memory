@@ -15,6 +15,7 @@ import {
   clearProjectEntries,
   norm,
   parseRerankAnswer,
+  passesRelevanceGate,
   prune,
   readQuery,
   readableEntries,
@@ -589,11 +590,12 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
     candidateCount: CONFIG.rerankCandidates,
   })
   const reranked = CONFIG.rerank ? await rerankCandidates(client, sessionID, query, ranked) : ranked
-  // Relevance floor: without RERANK, only keyword-qualified memories enter
-  // the relevance tier — a query that matches nothing surfaces nothing but
-  // the core slot (no noise for off-topic prompts). With RERANK, an explicit
-  // abstention returns [] here (same outcome, semantic gate instead).
-  const qualified = CONFIG.rerank ? reranked : reranked.filter((r) => r.keywordHits > 0)
+  // Relevance floor: without RERANK, only memories passing the lexical
+  // relevance gate enter the relevance tier — a query that matches nothing
+  // surfaces nothing but the core slot (no noise for off-topic prompts).
+  // With RERANK, an explicit abstention returns [] here (same outcome,
+  // semantic gate instead). Single-source policy: passesRelevanceGate().
+  const qualified = CONFIG.rerank ? reranked : reranked.filter(passesRelevanceGate)
   const top = qualified.slice(0, CONFIG.maxFacts)
   const selectedIds = new Set(top.map((r) => r.entry.id))
   const core = coreSlot(store, directory, selectedIds, t, CONFIG.coreSlot)
@@ -603,6 +605,7 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
       entry: e,
       base: score(e, t),
       keywordHits: 0,
+      matches: [],
       core: true,
       rank: top.length + i + 1,
       final: score(e, t),

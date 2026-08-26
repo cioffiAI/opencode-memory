@@ -6,6 +6,7 @@ function ranked(ids: string[]): RankedMemory[] {
     entry: { id, text: `fact ${id}`, category: "other", scope: "global", weight: 1, created: 0, lastSeen: 0, source: "dreamed" } as never,
     base: 10 - i,
     keywordHits: 0,
+    matches: [],
     core: false,
     rank: i + 1,
     final: 10 - i,

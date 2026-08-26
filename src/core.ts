@@ -113,10 +113,24 @@ export function norm(text: string): string {
     .trim()
 }
 
+// Tokenizer for MATCHING (v1.6): identifier boundaries are word boundaries.
+// camelCase / PascalCase are split ("userStore" -> "user","store"), snake/
+// kebab/dotted/path separators split via normalization. Both the WHOLE
+// compound ("javascript") and its parts ("java","script") are emitted, so
+// canonical names keep matching while inner terms stay reachable. Matching
+// never crosses these boundaries: a keyword cannot match because it occurs
+// INSIDE a longer unrelated token.
 export function tokens(text: string): string[] {
-  return norm(text)
-    .split(/\s+/)
-    .filter(Boolean)
+  const out = new Set<string>()
+  const camelRe = /([\p{Ll}])([\p{Lu}])/gu
+  for (const rawWord of text.split(/[^\p{L}\p{N}]+/u)) {
+    if (!rawWord) continue
+    const whole = rawWord.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase()
+    if (/\p{L}|\p{N}/u.test(whole)) out.add(whole)
+    const split = rawWord.replace(camelRe, "$1 $2").normalize("NFD").replace(/\p{M}/gu, "").toLowerCase()
+    for (const part of split.split(/\s+/)) if (part) out.add(part)
+  }
+  return [...out]
 }
 
 export function similarity(a: string, b: string): number {
@@ -530,11 +544,17 @@ const STOPWORDS = new Set([
   "uscire", "entrare", "i", "you", "we", "they", "he", "she", "it", "me", "us", "them", "him", "her", "my", "your",
   "our", "their", "this", "that", "these", "those", "please", "hello", "hi", "ok", "thanks", "thank", "there",
   "their", "about", "into", "onto", "over", "under", "between", "from", "after", "before", "during", "against",
+  "which",
   // Generic subject words: nearly every stored fact begins with "The user
   // ..." / "L'utente ...", so treating them as topic keywords made ANY query
   // mentioning them match EVERY entry, silently defeating the relevance gate
   // (found by the v1.5.1 falsifiable benchmark).
   "user", "users", "utente", "utenti",
+  // NOTE (v1.6): opinion/preference verbs (like/prefer/ama/piacere...) are
+  // deliberately NOT stopwords and NOT synonym-group members: as direct
+  // keywords their inflections bridge morphological variants
+  // (prefer -> prefers), while removing them from the synonym groups killed
+  // the unsafe cross-domain expansion ("color" -> "favorite").
 ])
 
 // Permanent core: operative preferences always surfaced regardless of topic.
@@ -545,40 +565,65 @@ export function topicKeywords(text: string): string[] {
 }
 
 // Bilingual synonym groups bridge the gap between semantic dedup (LLM) and
-// lexical retrieval without embeddings: a topic query about "linguaggi di
-// sistema" must also match a memory written as "the user codes in Rust".
+// lexical retrieval without embeddings. v1.6 policy: a group contains ONLY
+// terms that are substitutable for retrieval relevance — translations,
+// morphological variants, abbreviations or aliases of the SAME concept.
+// Related-but-not-interchangeable concepts (design vs project) and opinion
+// verbs (see STOPWORDS) do NOT belong here: expanding them made queries about
+// one domain surface memories from another.
+//
+// NOTE on lookup semantics: expansion stops at the FIRST group containing a
+// keyword (see expandTopicKeywordsDetailed). Groups sharing a head term on
+// purpose keep different expansions narrow — e.g. "database" expands to its
+// aliases {databases, db} but NOT to the broader data-family {data, dataset,
+// dati}, which is reachable only from "dataset"-family queries.
 const SYNONYM_GROUPS: string[][] = [
   ["language", "languages", "linguaggio", "linguaggi", "code", "codice", "coding", "programmazione", "programming"],
   ["system", "systems", "sistema", "sistemi", "platform", "piattaforma"],
-  ["color", "colors", "colore", "colori", "favorite", "favourite", "preferito", "preferita", "preferisce", "preferisci", "like", "loves", "ama", "piace", "piacciono"],
-  ["database", "databases", "db", "banca", "dati"],
+  ["color", "colors", "colore", "colori"],
+  ["database", "databases", "db"],
   ["plugin", "plugins", "estensione", "estensioni", "extension", "extensions", "addon", "addons"],
   ["app", "apps", "application", "applications", "applicazione", "applicazioni"],
   ["web", "website", "websites", "sito", "siti", "pagina", "pagine"],
   ["test", "tests", "testing", "testare", "verifica", "verifiche", "verificare"],
   ["bug", "bugs", "error", "errors", "errore", "errori", "issue", "issues"],
-  ["os", "operating", "sistema operativo"],
+  ["os", "operating"],
   ["memory", "memoria", "remember", "ricordare", "ricordi", "ricorda"],
   ["work", "works", "job", "jobs", "lavoro", "lavorare", "lavora", "lavori", "career", "carriera"],
   ["server", "servers", "hosting"],
   ["network", "networks", "rete", "reti", "networking"],
   ["security", "sicurezza", "secure", "sicuro", "privacy"],
-  ["design", "designer", "progettazione", "progettare", "progetto", "projects", "project"],
+  ["design", "designer", "progettazione", "progettare"],
+  ["project", "projects", "progetto", "progetti"],
   ["database", "data", "dataset", "dati"],
 ]
 
 // Expand topic keywords with all forms of their bilingual synonym group.
-export function expandTopicKeywords(keywords: string[]): string[] {
-  const out = new Set<string>(keywords)
+// The detailed variant records PROVENANCE: which query token produced each
+// expanded term (undefined = the term is a query token itself). Retrieval
+// explanations need this to attribute every match to its origin.
+export type ExpandedKeyword = {
+  term: string
+  /** original query topic keyword; undefined when term IS a query keyword */
+  via?: string
+}
+
+export function expandTopicKeywordsDetailed(keywords: string[]): ExpandedKeyword[] {
+  const out = new Map<string, string | undefined>()
+  for (const k of keywords) out.set(k, undefined)
   for (const k of keywords) {
     for (const group of SYNONYM_GROUPS) {
       if (group.includes(k)) {
-        for (const form of group) out.add(form)
+        for (const form of group) if (!out.has(form)) out.set(form, k)
         break
       }
     }
   }
-  return [...out]
+  return [...out.entries()].map(([term, via]) => (via === undefined ? { term } : { term, via }))
+}
+
+export function expandTopicKeywords(keywords: string[]): string[] {
+  return expandTopicKeywordsDetailed(keywords).map((x) => x.term)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,12 +638,69 @@ export type RankedMemory = {
   base: number
   // keywordHits: how many expanded topic keywords matched the memory text.
   keywordHits: number
+  // Per-keyword match provenance (v1.6): WHAT matched and HOW. This makes
+  // every surfacing decision auditable — see KeywordMatch / MatchKind.
+  matches: KeywordMatch[]
   // core: the memory was selected through its core tier slot, not relevance.
   core: boolean
   // rank: 1-based final position within the candidate window.
   rank: number
   // final: total ordering score (base + keyword bonus).
   final: number
+}
+
+// How an expanded keyword matched an entry. v1.6 policy: matches respect
+// token boundaries. "exact" = whole-token equality; "inflection" = a small,
+// explicit morphological variant (plural s/es/ies, gerund -ing, participle
+// -ed) in either direction; "category" = the keyword equals the entry's
+// category. Bare substring and open-ended prefix matching were REMOVED:
+// they made 'use' match 'user', 'test' match 'pytest'/'greatest' and 'red'
+// match 'redesign'. Legacy kinds are kept in the type so v1.5.1 evidence
+// files remain readable.
+export type MatchKind = "exact" | "prefix" | "substring" | "category" | "inflection"
+
+export type KeywordMatch = {
+  /** expanded keyword that matched */
+  keyword: string
+  kind: MatchKind
+  /** true when the keyword is itself a query topic keyword */
+  direct: boolean
+  /** query keyword that produced this term via synonym expansion */
+  via?: string
+}
+
+// Explicit morphological variants accepted by the matcher, in BOTH
+// directions (entry form of a query term, query form of an entry token).
+function inflectedForms(word: string): string[] {
+  const out = [`${word}s`, `${word}es`]
+  if (word.length >= 4) out.push(`${word}ing`, `${word}ed`)
+  if (word.length >= 4 && word.endsWith("y")) out.push(`${word.slice(0, -1)}ies`)
+  if (word.length >= 5 && word.endsWith("ies")) out.push(`${word.slice(0, -3)}y`)
+  return out
+}
+
+// Classify one expanded keyword against an entry under the v1.6
+// token-boundary policy. Returns undefined when there is no boundary-safe
+// match. Pure and side-effect free.
+export function classifyMatch(
+  _entryTextNorm: string,
+  entryTokens: string[],
+  category: string,
+  xk: ExpandedKeyword,
+): MatchKind | undefined {
+  if (entryTokens.includes(xk.term)) return "exact"
+  const forms = inflectedForms(xk.term)
+  if (entryTokens.some((t) => forms.includes(t))) return "inflection"
+  // reverse direction: the KEYWORD is an inflected form of an entry token
+  if (
+    entryTokens.some((t) => {
+      if (t.length < 3) return false
+      return inflectedForms(t).includes(xk.term)
+    })
+  )
+    return "inflection"
+  if (category === xk.term) return "category"
+  return undefined
 }
 
 export type RetrieveOptions = {
@@ -621,7 +723,7 @@ export function retrieve(
   opts: RetrieveOptions = {},
 ): RankedMemory[] {
   const window = opts.candidateCount ?? 30
-  const expanded = expandTopicKeywords(topicKeywords(query))
+  const expanded = expandTopicKeywordsDetailed(topicKeywords(query))
   const candidates = store.entries.filter(
     (e) =>
       e.status !== "SUPERSEDED" &&
@@ -630,15 +732,32 @@ export function retrieve(
       !(opts.excludeSensitivity && e.sensitivity && opts.excludeSensitivity.has(e.sensitivity)),
   )
   const ranked = candidates.map((e) => {
-    const et = norm(e.text)
-    const hits = expanded.length === 0 ? 0 : expanded.filter((k) => et.includes(k) || e.category === k).length
+    const etTokens = tokens(e.text)
+    const matches: KeywordMatch[] = []
+    for (const xk of expanded) {
+      const kind = classifyMatch("", etTokens, e.category, xk)
+      if (kind) {
+        matches.push(xk.via === undefined ? { keyword: xk.term, kind, direct: true } : { keyword: xk.term, kind, direct: false, via: xk.via })
+      }
+    }
     const base = score(e, t)
-    return { entry: e, base, keywordHits: hits, core: false, rank: 0, final: base + hits * KEYWORD_BONUS }
+    return { entry: e, base, keywordHits: matches.length, matches, core: false, rank: 0, final: base + matches.length * KEYWORD_BONUS }
   })
   ranked.sort((a, b) => b.final - a.final)
   const top = ranked.slice(0, window)
   top.forEach((r, i) => (r.rank = i + 1))
   return top
+}
+
+// ---------------------------------------------------------------------------
+// SURFACE relevance gate (v1.6): candidate generation and surfacing are
+// DIFFERENT decisions. retrieve() returns high-recall candidates ranked by
+// score; the gate decides what is relevant enough to inject. Lexical policy:
+// at least one boundary-safe keyword match. It is deliberately conservative
+// and deterministic; semantic judgment belongs to the optional reranker.
+// ---------------------------------------------------------------------------
+export function passesRelevanceGate(r: Pick<RankedMemory, "matches">): boolean {
+  return r.matches.length > 0
 }
 
 // Core-slot selection: core-tier memories that did NOT rank via relevance

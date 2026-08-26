@@ -237,16 +237,19 @@ describe("applyConsolidation", () => {
 
 describe("retrieve", () => {
   test("ranks keyword matches above unrelated memories and breaks down the score", () => {
+    // v1.6: opinion verbs ("preferred") are stopwords; the bridge is the
+    // domain noun via translation (colore -> color).
     const t = Date.now()
     const store = emptyStore()
     store.entries = [
-      { ...entry({ id: "geo", text: "The user likes green.", category: "preferences", weight: 1, source: "dreamed" }) },
+      { ...entry({ id: "geo", text: "The user's favorite color is green.", category: "preferences", weight: 1, source: "dreamed" }) },
       { ...entry({ id: "db", text: "The user maintains a PostgreSQL database.", category: "status", weight: 1, source: "dreamed" }) },
     ]
-    const res = retrieve(store, undefined, "which color is preferred?", t)
+    const res = retrieve(store, undefined, "quale colore è preferito?", t)
     const top = res[0]
     expect(top.entry.id).toBe("geo")
     expect(top.keywordHits).toBeGreaterThan(0)
+    expect(top.matches.every((m) => ["exact", "inflection", "category"].includes(m.kind))).toBe(true)
     expect(top.final).toBe(top.base + top.keywordHits * 3)
     expect(top.rank).toBe(1)
   })

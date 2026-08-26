@@ -1,0 +1,473 @@
+[
+  {
+    "scenarioId": "fp-02",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "what test framework should I use here?",
+    "memoryIndex": 0,
+    "text": "The user keeps a test account for staging.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 2,
+    "final": 8,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "test",
+        "kind": "exact",
+        "direct": true
+      },
+      {
+        "keyword": "use",
+        "kind": "prefix",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 2 keyword match(es) [test:exact, use:prefix]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "fp-05",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "what color theme does the user prefer in the IDE?",
+    "memoryIndex": 0,
+    "text": "The user's favorite coffee is from the green roastery.",
+    "category": "preferences",
+    "scope": "global",
+    "tier": "core",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "favorite",
+        "kind": "exact",
+        "direct": false,
+        "via": "color"
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [favorite:exact via 'color']",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "hn-01",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "which database should we pick for this new app?",
+    "memoryIndex": 0,
+    "text": "The user manages a small database of recipes.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "database",
+        "kind": "exact",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [database:exact]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "hn-02",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "how much RAM should the Postgres container get?",
+    "memoryIndex": 0,
+    "text": "The user's laptop has 16 GB of RAM.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "ram",
+        "kind": "exact",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [ram:exact]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "hn-03",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "write a bash shell script that renames files",
+    "memoryIndex": 0,
+    "text": "The user prefers the fish shell on Linux.",
+    "category": "preferences",
+    "scope": "global",
+    "tier": "core",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "shell",
+        "kind": "exact",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [shell:exact]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "hn-04",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "run the test suite for module payments",
+    "memoryIndex": 0,
+    "text": "The user runs tests before every commit.",
+    "category": "preferences",
+    "scope": "global",
+    "tier": "core",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 3,
+    "final": 11,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "run",
+        "kind": "prefix",
+        "direct": true
+      },
+      {
+        "keyword": "test",
+        "kind": "prefix",
+        "direct": true
+      },
+      {
+        "keyword": "tests",
+        "kind": "exact",
+        "direct": false,
+        "via": "test"
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 3 keyword match(es) [run:prefix, test:prefix, tests:exact via 'test']",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "hn-05",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "bun install is failing in CI, fix it",
+    "memoryIndex": 0,
+    "text": "The user wrote a blog post about Bun.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "bun",
+        "kind": "exact",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [bun:exact]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "hn-06",
+    "tags": [
+      "hard-negative"
+    ],
+    "query": "enable dark mode in the generated PDF report",
+    "memoryIndex": 0,
+    "text": "The user prefers dark mode in editors.",
+    "category": "preferences",
+    "scope": "global",
+    "tier": "core",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 2,
+    "final": 8,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "dark",
+        "kind": "exact",
+        "direct": true
+      },
+      {
+        "keyword": "mode",
+        "kind": "exact",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 2 keyword match(es) [dark:exact, mode:exact]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "sr-01",
+    "tags": [
+      "semantic-distractor"
+    ],
+    "query": "what phone does the user have?",
+    "memoryIndex": 0,
+    "text": "The user's brother repairs phones for a living.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "phone",
+        "kind": "prefix",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [phone:prefix]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "sr-04",
+    "tags": [
+      "semantic-distractor"
+    ],
+    "query": "where does the user deploy their side projects?",
+    "memoryIndex": 0,
+    "text": "The user's colleague deploys to Kubernetes every day.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "deploy",
+        "kind": "prefix",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [deploy:prefix]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "xl-02",
+    "tags": [
+      "xl-negative"
+    ],
+    "query": "what color should the error banner in this app be?",
+    "memoryIndex": 0,
+    "text": "Il colore preferito dell'utente è il verde.",
+    "category": "preferences",
+    "scope": "global",
+    "tier": "core",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 3,
+    "final": 11,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "color",
+        "kind": "prefix",
+        "direct": true
+      },
+      {
+        "keyword": "colore",
+        "kind": "exact",
+        "direct": false,
+        "via": "color"
+      },
+      {
+        "keyword": "preferito",
+        "kind": "exact",
+        "direct": false,
+        "via": "color"
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 3 keyword match(es) [color:prefix, colore:exact via 'color', preferito:exact via 'color']",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "xl-03",
+    "tags": [
+      "xl-negative"
+    ],
+    "query": "which operating system does the production server run?",
+    "memoryIndex": 0,
+    "text": "L'utente trova i sistemi operativi affascinanti.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "sistemi",
+        "kind": "exact",
+        "direct": false,
+        "via": "system"
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [sistemi:exact via 'system']",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "xl-04",
+    "tags": [
+      "xl-negative"
+    ],
+    "query": "this job posting looks interesting, review it",
+    "memoryIndex": 0,
+    "text": "L'utente ama il lavoro nel settore AI.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "lavoro",
+        "kind": "exact",
+        "direct": false,
+        "via": "job"
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [lavoro:exact via 'job']",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "xl-05",
+    "tags": [
+      "xl-negative"
+    ],
+    "query": "configura il server MCP per questo ambiente",
+    "memoryIndex": 0,
+    "text": "The user keeps his server in the basement.",
+    "category": "status",
+    "scope": "global",
+    "tier": "archival",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "server",
+        "kind": "exact",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [server:exact]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  },
+  {
+    "scenarioId": "cn-02",
+    "tags": [
+      "core-only"
+    ],
+    "query": "refactor the auth middleware to use async/await",
+    "memoryIndex": 0,
+    "text": "The user's editor is Neovim.",
+    "category": "preferences",
+    "scope": "global",
+    "tier": "core",
+    "status": "ACTIVE",
+    "pinned": false,
+    "base": 2,
+    "keywordHits": 1,
+    "final": 5,
+    "surfaceRank": 1,
+    "matches": [
+      {
+        "keyword": "use",
+        "kind": "prefix",
+        "direct": true
+      }
+    ],
+    "gatePassed": true,
+    "gateReason": "relevance tier: 1 keyword match(es) [use:prefix]",
+    "viaCoreSlot": false,
+    "isFalsePositive": true
+  }
+]

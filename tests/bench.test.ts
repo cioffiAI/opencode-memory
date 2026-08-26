@@ -55,7 +55,7 @@ describe("metrics computation", () => {
       result({ expected: [0], retrieved: [0], rankFirst: 1 }),
       result({ id: "neg", expected: [], retrieved: [], rankFirst: 0 }),
     ])
-    expect(m.recallAtK).toBe(1)
+    expect(m.recallAt5).toBe(1)
     expect(m.mrr).toBe(1)
     expect(m.negatives).toBe(1)
   })
@@ -85,6 +85,6 @@ describe("metrics computation", () => {
       result({ expected: [0, 4], qualifiedSurfaced: [0, 9], falseSurfaced: [9] }),
       result({ id: "empty", expected: [0], qualifiedSurfaced: [] }),
     ])
-    expect(m.surfacePrecision).toBeCloseTo(((1 / 2) + 0) / 2)
+    expect(m.surfacePrecisionMacro).toBeCloseTo(((1 / 2) + 0) / 2)
   })
 })
