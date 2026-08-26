@@ -140,49 +140,76 @@ frequently-surfaced memory immortal under pruning. Negative feedback
 | `OPENCODE_MEMORY_GC_CHILD_AGE_MS` | 600000 | Min age of an orphan child session before auto-removal. |
 | `OPENCODE_MEMORY_INPROGRESS_TIMEOUT_MS` | 600000 | Expiry of the `inProgress` marker (crash recovery). |
 
+## Retrieval semantics (v1.6)
+
+The lexical pipeline is a small, independently testable chain:
+
+tokenizer → keyword extraction → alias expansion → candidate generation
+(scope/status/sensitivity filter) → boundary-safe matching → scoring →
+**relevance gate** → surface (+ optional semantic rerank with abstention).
+
+Matching rules, enforced in `src/core.ts` and covered by regression tests:
+
+- **Token boundaries are sacred.** A keyword matches whole normalized tokens
+  only. `use` never matches `user`, `test` never matches `pytest`/
+  `greatest`, `red` never matches `redesign`. Bare substring and open-ended
+  prefix matching were removed in v1.6.
+- **Identifiers are first-class.** camelCase/PascalCase split at case
+  boundaries (`userStore` → `user` + `store`); snake_case, kebab-case,
+  dotted names and paths split on their separators. Both the whole compound
+  (`javascript`) and its parts match.
+- **Morphology is explicit and small**: plural (`deploy`↔`deploys`), gerund
+  (`network`↔`networking`) and participle (`test`↔`tested`) forms match in
+  both directions. Nothing else.
+- **Synonym groups contain only substitutable terms** (translations,
+  aliases, abbreviations of the SAME concept: `colore`↔`color`,
+  `job`↔`lavoro`, `db`↔`database`). Opinion verbs (`like`, `prefer`,
+  `favorite`…) are not synonyms of anything and no longer bridge domains.
+- The **relevance gate** is a named single-source predicate
+  (`passesRelevanceGate`): candidates without at least one boundary-safe
+  match never enter the injected block; the core slot stays contractual.
+- Every surfacing decision is explainable: `retrieve()` returns per-keyword
+  provenance (`keyword:kind via query-term`), and
+  `bun run bench --explain-negatives` dumps it machine-readably.
+
 ## Retrieval benchmark
 
-`bun run bench` runs the scenario suite (115 scenarios: 77 positive, 38
-negative) through the pure harness in `bench/lib.ts`. Every metric measures an
-independently meaningful property, and negative scenarios can genuinely fail:
+Two scenario sets, one harness (`bench/lib.ts`):
 
-- **Candidate quality** (full ranking, before any gating): Recall@5 and MRR.
-- **SURFACE quality**: precision of the relevance tier actually injected
-  (core-slot entries are excluded from both sides — they are contractually
-  always-on).
-- **False-positive rate**: share of negative queries (clean no-match, hard
-  negatives sharing lexical terms, semantically adjacent distractors,
-  cross-language collisions, project-isolation negatives, core-only queries)
-  where at least one irrelevant entry entered the relevance tier.
-  **Abstention rate** = 1 − FP rate.
-- **Context overhead**: mean tokens of the full simulated block.
+- **DEV/REGRESSION set** (115 scenarios: 77 positive / 38 negative across six
+  negative categories) — used while developing; its positives are frozen
+  since v1.5.0 and must never be edited to flatter the algorithm.
+- **HELD-OUT set** (20 scenarios) — written once from the feature contract
+  BEFORE the v1.6 fixes were implemented and not iterated against. It
+  includes identifier/package-name/path traps, bilingual weak associations,
+  related-tech-wrong-fact and declared CEILING-MEASURE cases.
 
-Current numbers (lexical pipeline, reranker disabled):
+Metrics (identical in human and `--json` output): Recall@1, Recall@5, MRR
+(candidate quality, before any gate), macro and entry-level surface
+precision, false-abstention rate on positives, query-level false-positive
+rate with memory-level counts, abstention breakdown for negatives (fully
+abstained / core-slot only / irrelevant non-core surfaced), Wilson 95%
+confidence intervals, average surfaced memories and context overhead.
+
+Current results (lexical pipeline, reranker disabled):
 
 ```text
-Recall@5:            100.0%
-MRR (first hit):      95.2%
-Surface precision:    65.8%
-False-positive rate:  39.5%  (15/38 negative queries)
-Abstention rate:      60.5%
-Context overhead:     9.5 tokens/query
+DEV set     Recall@5 100% · MRR 95.2% · surface precision 63.2% macro /
+            81.8% entry-level (54/66) · FPR 34.2% (13/38) · overhead 9.1 tok
+HELD-OUT    Recall@5 100% · MRR 100%  · FPR 26.7% (4/15) · 0 false abstentions
+            (v1.5.1 algorithm measured on the same held-out set: FPR 46.7%,
+             7/15, including every identifier/substring trap)
 ```
 
-Interpretation: candidate quality is high, but the purely lexical stage has
-real limitations, now measured instead of hidden:
-
-- Queries whose relevant memory shares NO content word (true paraphrase,
-  much of the cross-language suite) correctly pass nothing into the relevance
-  tier — surface precision counts those as misses. Enable
-  `OPENCODE_MEMORY_RERANK=1` for semantic rescue of these cases.
-- Hard negatives sharing lexical material ("test", "database", "server",
-  "security"…) can still surface an irrelevant memory (39.5% FP rate on
-  negative queries). This is the known ceiling of keyword retrieval without
-  embeddings; the optional reranker with abstention is the mitigation path.
-
-Positive scenarios were frozen before this release and are not tuned against
-the synonym table; negatives are designed against the product contract, not
-the implementation.
+Interpretation: all remaining negative-scenario failures are exact-token or
+true-translation matches whose INTENT differs ("test account" vs test
+framework question, "server in the basement" vs MCP server configuration,
+relational facts like "the brother repairs phones"). No mechanical matching
+bug remains in either set. This is the honest ceiling of zero-dependency
+lexical retrieval; the mitigation path already shipped is the optional
+semantic reranker with abstention (`OPENCODE_MEMORY_RERANK=1`). Embeddings
+are NOT yet justified by this evidence: the residual errors are intent/attribution
+problems, which bag-of-embeddings only partially addresses.
 
 ## Privacy
 

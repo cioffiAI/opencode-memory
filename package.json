@@ -1,7 +1,7 @@
 {
   "name": "@cioffi_ai/opencode-memory",
-  "version": "1.5.1",
-  "description": "Local-first persistent memory for OpenCode using a WRITE → DREAM → SURFACE lifecycle.",
+  "version": "1.6.0",
+  "description": "Local-first persistent memory for OpenCode using a WRITE \u2192 DREAM \u2192 SURFACE lifecycle.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": "./dist/index.js",

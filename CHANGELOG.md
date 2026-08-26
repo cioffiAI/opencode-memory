@@ -3,6 +3,66 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.0] — 2026-08-26
+
+Retrieval Evaluation / Relevance. Retrieval semantics change (user-visible);
+API compatible. No new features; no new dependencies.
+
+### Fixed
+
+- **Unsafe substring matching removed.** The matcher now respects token
+  boundaries: `use` no longer matches `user`, `test` no longer matches
+  `pytest`/`greatest`, `red` no longer matches `redesign`. Confirmed by the
+  v1.5.1 evidence file `bench/evidence/v1.5.1-fp-taxonomy.json`.
+- **Synonym groups restricted to substitutable terms.** Opinion/preference
+  verbs were removed from the color group (they bridged "color" queries to
+  unrelated "favorite X" facts); `design` and `project` families are split;
+  the standalone Italian word `banca` no longer expands to database terms;
+  the dead phrase member `"sistema operativo"` was dropped.
+- **camelCase identifiers tokenize correctly**: the boundary splitter only
+  splits at lowercase→uppercase transitions ("RAM", "GB" stay whole;
+  "userStore"/"JavaScript" produce both parts and the whole form).
+
+### Changed
+
+- **Candidate generation is separated from surfacing relevance.**
+  `retrieve()` returns high-recall candidates; a named single-source
+  relevance gate (`passesRelevanceGate`) decides what enters the injected
+  block, shared by the plugin and the benchmark harness.
+- **Every match carries provenance** (`keyword`, `kind`
+  exact/inflection/category, `direct`, `via` query term):
+  `bun run bench --explain-negatives [--heldout] [--fp-only]` emits the full
+  machine-readable taxonomy of what surfaced and why.
+- **Morphology is explicit**: plural s/es/ies, gerund -ing and participle -ed
+  match in both directions; nothing else does.
+- **Reranker extracted to `src/rerank.ts`** with an injectable client:
+  abstention, invalid-answer fallback, timeout fallback, per-query caching,
+  zero-tool containment propagation and local-only filtering are unit-tested
+  with deterministic fakes (`tests/reranker.test.ts`). Behavior unchanged.
+- **Benchmark**: added Recall@1, entry-level surface precision with pooled
+  counts, false-abstention rate on positives, memory-level FP counts,
+  negative-outcome breakdown (abstained / core-only / non-core surfaced),
+  Wilson 95% confidence intervals, average memories surfaced; separate
+  HELD-OUT evaluation set (`bench/scenarios-heldout.ts`, `--heldout`)
+  written before the fixes and not iterated against.
+
+### Measured (lexical pipeline, reranker disabled)
+
+| metric | v1.5.1 | v1.6.0 |
+| --- | --- | --- |
+| Recall@5 (dev) | 100% | 100% |
+| MRR (dev) | 95.2% | 95.2% |
+| Surface precision macro (dev) | 65.8% | 63.2% |
+| FPR negative queries (dev) | 39.5% (15/38) | 34.2% (13/38) |
+| FPR held-out | 46.7% (7/15) | 26.7% (4/15) |
+| False abstentions (dev) | 26.0% (20/77) | 31.2% (24/77) |
+
+The three new false abstentions (kw-02, co-05, ob-05) all relied on the same
+removed noise bridge (`use` prefix-matching the universal "user" token).
+All 13 remaining dev-set failures are exact-token or true-translation matches
+whose intent differs — documented as the lexical ceiling; embeddings are NOT
+yet justified by this evidence.
+
 ## [1.5.1] — 2026-08-26
 
 Trust-boundaries hardening release. No new features; every change tightens an
