@@ -1,50 +1,93 @@
-// Benchmark scenarios: each case builds a synthetic store (or a subset of
-// memories) and defines the expected retrieval result.
+// Evaluation scenarios for the lexical retrieval pipeline.
 //
-// ids map to store indexes m0..mN inside each scenario. expected: [] means
-// nothing should surface. tags group scenarios by failure mode so the report
-// can break Recall down per category.
+// Each scenario builds a memory store, runs a query and declares which
+// indices of `memories` SHOULD be retrieved (expected). Scenarios with an
+// empty `expected` are NEGATIVE cases: they pass only when the relevance tier
+// surfaces nothing. Unlike a metric defined on the output of the selection
+// rule itself, these cases can genuinely fail — a hard negative that shares
+// lexical material with an irrelevant memory will surface that memory and be
+// counted as a false positive.
+//
+// Tags classify the property under test:
+//
+//   keyword        — exact keyword overlap (positive)
+//   paraphrase     — same meaning, different wording (positive)
+//   it-en / en-it  — cross-language equivalence (positive)
+//   synonym        — bilingual synonym groups (positive)
+//   distractor     — irrelevant memories present, correct one must win
+//   contradiction  — outdated memory vs newer one, query must find the newer
+//   duplicate      — two near-identical entries, canonical one must win
+//   isolation      — project-scoped memories must answer only in their project
+//   obsolete       — very old memories must rank below fresh relevant ones
+//   superseded     — tombstoned memories must never be retrieved
+//   feedback       — helpful/irrelevant feedback modulates ranking
+//
+// Negative categories (expected = []):
+//   none             — clean no-match queries against unrelated memories
+//   hard-negative    — shares lexical terms with an irrelevant memory
+//   semantic-distractor — topically adjacent memory that does NOT answer
+//   xl-negative      — cross-language lexical collisions with irrelevant facts
+//   isolation-negative — another project's memory must not leak
+//   core-only        — nothing relevant; only the contractual core slot may appear
+//
+// NOTE: positive scenarios were frozen before this hardening release and are
+// not tuned against the current synonym table or algorithm. Negative
+// scenarios are designed adversarially against the FEATURE CONTRACT ("do not
+// surface memories that do not answer the question"), not against the
+// implementation.
 
-const ST = "status"
-const PREF = "preferences"
-const PROJ = "project"
-
-type Memory = {
+export type ScenarioMemory = {
   text: string
   category?: string
+  weight?: number
   scope?: "global" | "project"
   projectID?: string
-  weight?: number
   lastSeenAgoDays?: number
+  status?: "ACTIVE" | "CONFLICTED" | "SUPERSEDED"
+  pinned?: boolean
   helpful?: number
   irrelevant?: number
 }
 
-type Scenario = {
+export type Scenario = {
   id: string
   tags: string[]
-  memories: Memory[]
+  memories: ScenarioMemory[]
   query: string
   expected: number[]
   directory?: string
 }
 
-export const SCENARIOS: Scenario[] = [
-  // ---- keyword: literal word matches --------------------------------
-  { id: "kw-01", tags: ["keyword"], memories: [{ text: "The user prefers TypeScript over JavaScript.", category: PREF }], query: "which language does the user prefer?", expected: [0] },
-  { id: "kw-02", tags: ["keyword"], memories: [{ text: "The user works on a MacBook Air M4.", category: ST }], query: "what laptop does the user use?", expected: [0] },
-  { id: "kw-03", tags: ["keyword"], memories: [{ text: "The user prefers dark mode in the editor.", category: PREF }], query: "dark mode or light mode?", expected: [0] },
-  { id: "kw-04", tags: ["keyword"], memories: [{ text: "The user uses Bun as the runtime.", category: ST }], query: "what runtime does the user use?", expected: [0] },
-  { id: "kw-05", tags: ["keyword"], memories: [{ text: "The user writes documentation in English.", category: PREF }], query: "which language for docs?", expected: [0] },
-  { id: "kw-06", tags: ["keyword"], memories: [{ text: "The user runs tests before every commit.", category: PREF }], query: "does the user run tests?", expected: [0] },
-  { id: "kw-07", tags: ["keyword"], memories: [{ text: "The user prefers the arc browser.", category: PREF }], query: "which browser does the user prefer?", expected: [0] },
-  { id: "kw-08", tags: ["keyword"], memories: [{ text: "The user codes in Rust for systems programming.", category: ST }], query: "what language for low-level code?", expected: [0] },
-  { id: "kw-09", tags: ["keyword"], memories: [{ text: "The user prefers PostgreSQL over MySQL.", category: PREF }], query: "which database does the user prefer?", expected: [0] },
-  { id: "kw-10", tags: ["keyword"], memories: [{ text: "The user uses Neovim as the editor.", category: ST }], query: "which editor does the user use?", expected: [0] },
+// Categories whose scenarios must have empty `expected`.
+export const NEGATIVE_TAGS = new Set([
+  "none",
+  "hard-negative",
+  "semantic-distractor",
+  "xl-negative",
+  "isolation-negative",
+  "core-only",
+])
 
-  // ---- paraphrase: same meaning, different words ---------------------
-  { id: "pa-01", tags: ["paraphrase"], memories: [{ text: "The user prefers green as their favorite color.", category: PREF }], query: "what is the user's favorite color?", expected: [0] },
-  { id: "pa-02", tags: ["paraphrase"], memories: [{ text: "The user is a vegetarian.", category: ST }], query: "does the user eat meat?", expected: [0] },
+const PREF = "preferences"
+const ST = "status"
+const PROJ = "project"
+
+export const SCENARIOS: Scenario[] = [
+  // ---- keyword: exact overlap -------------------------------------------
+  { id: "kw-01", tags: ["keyword"], memories: [{ text: "The user prefers TypeScript over JavaScript.", category: PREF }], query: "which language does the user prefer?", expected: [0] },
+  { id: "kw-02", tags: ["keyword"], memories: [{ text: "The user works with PostgreSQL and Redis.", category: ST }], query: "what database does the user use?", expected: [0] },
+  { id: "kw-03", tags: ["keyword"], memories: [{ text: "The user prefers the fish shell on Linux.", category: PREF }], query: "which shell does the user prefer?", expected: [0] },
+  { id: "kw-04", tags: ["keyword"], memories: [{ text: "The user's laptop has 16 GB of RAM.", category: ST }], query: "how much RAM does the laptop have?", expected: [0] },
+  { id: "kw-05", tags: ["keyword"], memories: [{ text: "The user uses git with conventional commits.", category: PREF }], query: "what git workflow does the user use?", expected: [0] },
+  { id: "kw-06", tags: ["keyword"], memories: [{ text: "The user prefers dark mode in editors.", category: PREF }], query: "dark mode or light mode?", expected: [0] },
+  { id: "kw-07", tags: ["keyword"], memories: [{ text: "The user wrote a blog post about Bun.", category: ST }], query: "has the user written anything about Bun?", expected: [0] },
+  { id: "kw-08", tags: ["keyword"], memories: [{ text: "The user prefers keyboard-only navigation.", category: PREF }], query: "does the user use the mouse or the keyboard?", expected: [0] },
+  { id: "kw-09", tags: ["keyword"], memories: [{ text: "The user's editor of choice is Neovim.", category: PREF }], query: "what editor does the user use?", expected: [0] },
+  { id: "kw-10", tags: ["keyword"], memories: [{ text: "The user prefers the arc browser.", category: PREF }], query: "which browser does the user prefer?", expected: [0] },
+
+  // ---- paraphrase: same meaning, different wording ------------------------
+  { id: "pa-01", tags: ["paraphrase"], memories: [{ text: "The user codes in Rust for systems programming.", category: PREF }], query: "which language for low-level utilities?", expected: [0] },
+  { id: "pa-02", tags: ["paraphrase"], memories: [{ text: "The user drinks three coffees before noon.", category: ST }], query: "how much caffeine does the user consume in the morning?", expected: [0] },
   { id: "pa-03", tags: ["paraphrase"], memories: [{ text: "The user is allergic to shellfish.", category: ST }], query: "any food allergies to watch out for?", expected: [0] },
   { id: "pa-04", tags: ["paraphrase"], memories: [{ text: "The user sleeps seven hours per night.", category: ST }], query: "what is the user's nightly sleep duration?", expected: [0] },
   { id: "pa-05", tags: ["paraphrase"], memories: [{ text: "The user pays for the ChatGPT Pro plan.", category: ST }], query: "is the user a paying ChatGPT customer?", expected: [0] },
@@ -166,7 +209,7 @@ export const SCENARIOS: Scenario[] = [
     { text: "Everything the user writes runs on bun.", category: ST, weight: 1 },
   ], query: "what runtime does the user use?", expected: [0] },
 
-  // ---- isolation: project scope must not leak ------------------------------
+  // ---- isolation: project scope answers in its own project ----------------
   { id: "is-01", tags: ["isolation"], memories: [
     { text: "This project uses Bun and TypeScript.", category: PROJ, scope: "project", projectID: "/workspace/plugin" },
     { text: "This project uses Flask and Python.", category: PROJ, scope: "project", projectID: "/workspace/api" },
@@ -188,7 +231,7 @@ export const SCENARIOS: Scenario[] = [
     { text: "Coding style: tabs, 120 columns.", category: PROJ, scope: "project", projectID: "/a" },
     { text: "Coding style: spaces, 80 columns.", category: PROJ, scope: "project", projectID: "/b" },
   ], query: "what indentation style does this project use?", expected: [0], directory: "/a" },
-  { id: "is-06", tags: ["isolation"], memories: [
+  { id: "is-06", tags: ["isolation", "isolation-negative"], memories: [
     { text: "The user only browses /b from this laptop.", category: PROJ, scope: "project", projectID: "/x" },
   ], query: "does any project memory exist for /y?", expected: [], directory: "/y" },
 
@@ -214,24 +257,118 @@ export const SCENARIOS: Scenario[] = [
     { text: "The user is on macOS now.", category: ST, lastSeenAgoDays: 10, weight: 2 },
   ], query: "which OS does the user use?", expected: [1] },
 
-  // ---- false positive: shared words, different meaning ---------------------
-  { id: "fp-01", tags: ["false-positive"], memories: [
+  // ---- superseded: tombstones never resurface ------------------------------
+  { id: "su-01", tags: ["superseded"], memories: [
+    { text: "The user now uses Bun as package manager.", category: PREF, weight: 3, lastSeenAgoDays: 1 },
+    { text: "The user uses npm as the package manager.", category: PREF, weight: 3, status: "SUPERSEDED" },
+  ], query: "which package manager does the user use?", expected: [0] },
+  { id: "su-02", tags: ["superseded"], memories: [
+    { text: "The user moved to Milan last month.", category: ST, weight: 3, lastSeenAgoDays: 2 },
+    { text: "The user lives in Rome.", category: ST, weight: 3, status: "SUPERSEDED" },
+  ], query: "where does the user live?", expected: [0] },
+
+  // ---- conflicted: flagged entries stay visible but never outrank the fix --
+  { id: "cf-01", tags: ["contradiction"], memories: [
+    { text: "From today the user commits with Bun.", category: PREF, weight: 3, lastSeenAgoDays: 1 },
+    { text: "The user always commits with npm.", category: PREF, weight: 3, status: "CONFLICTED", lastSeenAgoDays: 30 },
+  ], query: "how does the user commit changes?", expected: [0] },
+
+  // ---- false positive legacy cases (kept as hard-negative history) --------
+  { id: "fp-01", tags: ["hard-negative"], memories: [
     { text: "The user likes the color of the rust bike frame.", category: PREF },
   ], query: "which language did the user pick for the CLI?", expected: [] },
-  { id: "fp-02", tags: ["false-positive"], memories: [
+  { id: "fp-02", tags: ["hard-negative"], memories: [
     { text: "The user keeps a test account for staging.", category: ST },
   ], query: "what test framework should I use here?", expected: [] },
-  { id: "fp-03", tags: ["false-positive"], memories: [
+  { id: "fp-03", tags: ["hard-negative"], memories: [
     { text: "The memory plugin stores facts on disk.", category: ST },
   ], query: "how much RAM does the user's machine have?", expected: [] },
-  { id: "fp-04", tags: ["false-positive"], memories: [
+  { id: "fp-04", tags: ["hard-negative"], memories: [
     { text: "The user prefers working with data pipelines.", category: PREF },
   ], query: "which database should we choose for the app?", expected: [] },
-  { id: "fp-05", tags: ["false-positive"], memories: [
+  { id: "fp-05", tags: ["hard-negative"], memories: [
     { text: "The user's favorite coffee is from the green roastery.", category: PREF },
   ], query: "what color theme does the user prefer in the IDE?", expected: [] },
 
-  // ---- none: nothing relevant ----------------------------------------------
+  // ---- hard negatives: strong lexical collision, different meaning --------
+  { id: "hn-01", tags: ["hard-negative"], memories: [
+    { text: "The user manages a small database of recipes.", category: ST },
+  ], query: "which database should we pick for this new app?", expected: [] },
+  { id: "hn-02", tags: ["hard-negative"], memories: [
+    { text: "The user's laptop has 16 GB of RAM.", category: ST },
+  ], query: "how much RAM should the Postgres container get?", expected: [] },
+  { id: "hn-03", tags: ["hard-negative"], memories: [
+    { text: "The user prefers the fish shell on Linux.", category: PREF },
+  ], query: "write a bash shell script that renames files", expected: [] },
+  { id: "hn-04", tags: ["hard-negative"], memories: [
+    { text: "The user runs tests before every commit.", category: PREF },
+  ], query: "run the test suite for module payments", expected: [] },
+  { id: "hn-05", tags: ["hard-negative"], memories: [
+    { text: "The user wrote a blog post about Bun.", category: ST },
+  ], query: "bun install is failing in CI, fix it", expected: [] },
+  { id: "hn-06", tags: ["hard-negative"], memories: [
+    { text: "The user prefers dark mode in editors.", category: PREF },
+  ], query: "enable dark mode in the generated PDF report", expected: [] },
+
+  // ---- semantic distractors: adjacent topic, does not answer ---------------
+  { id: "sr-01", tags: ["semantic-distractor"], memories: [
+    { text: "The user's brother repairs phones for a living.", category: ST },
+  ], query: "what phone does the user have?", expected: [] },
+  { id: "sr-02", tags: ["semantic-distractor"], memories: [
+    { text: "The user's sister is learning Python.", category: ST },
+  ], query: "which language does the user prefer for scripting?", expected: [] },
+  { id: "sr-03", tags: ["semantic-distractor"], memories: [
+    { text: "The user's neighbor works at a PostgreSQL company.", category: ST },
+  ], query: "which database does the user administer?", expected: [] },
+  { id: "sr-04", tags: ["semantic-distractor"], memories: [
+    { text: "The user's colleague deploys to Kubernetes every day.", category: ST },
+  ], query: "where does the user deploy their side projects?", expected: [] },
+  { id: "sr-05", tags: ["semantic-distractor"], memories: [
+    { text: "The user's manager prefers meetings in the morning.", category: ST },
+  ], query: "when does the user want to stand up?", expected: [] },
+
+  // ---- cross-language negatives -------------------------------------------
+  { id: "xl-01", tags: ["xl-negative"], memories: [
+    { text: "The user works from home on Fridays.", category: PREF },
+  ], query: "che database usa l'utente per questo progetto?", expected: [] },
+  { id: "xl-02", tags: ["xl-negative"], memories: [
+    { text: "Il colore preferito dell'utente è il verde.", category: PREF },
+  ], query: "what color should the error banner in this app be?", expected: [] },
+  { id: "xl-03", tags: ["xl-negative"], memories: [
+    { text: "L'utente trova i sistemi operativi affascinanti.", category: ST },
+  ], query: "which operating system does the production server run?", expected: [] },
+  { id: "xl-04", tags: ["xl-negative"], memories: [
+    { text: "L'utente ama il lavoro nel settore AI.", category: ST },
+  ], query: "this job posting looks interesting, review it", expected: [] },
+  { id: "xl-05", tags: ["xl-negative"], memories: [
+    { text: "The user keeps his server in the basement.", category: ST },
+  ], query: "configura il server MCP per questo ambiente", expected: [] },
+
+  // ---- project-isolation negatives -----------------------------------------
+  { id: "pi-01", tags: ["isolation-negative"], memories: [
+    { text: "This project uses pnpm as package manager.", category: PROJ, scope: "project", projectID: "/a" },
+  ], query: "which package manager does this project use?", expected: [], directory: "/b" },
+  { id: "pi-02", tags: ["isolation-negative"], memories: [
+    { text: "Tests run with vitest in this repo.", category: PROJ, scope: "project", projectID: "/a" },
+  ], query: "how do I run the tests here?", expected: [], directory: "/b" },
+  { id: "pi-03", tags: ["isolation-negative"], memories: [
+    { text: "Deploy target is Fly.io.", category: PROJ, scope: "project", projectID: "/backend" },
+    { text: "Deploy target is Vercel.", category: PROJ, scope: "project", projectID: "/frontend" },
+  ], query: "where is this service deployed?", expected: [], directory: "/cli" },
+
+  // ---- core-only: nothing relevant; only the contractual core slot may show -
+  { id: "cn-01", tags: ["core-only"], memories: [
+    { text: "The user prefers TypeScript over JavaScript.", category: PREF },
+    { text: "The user likes green.", category: PREF },
+  ], query: "fix the flaky integration test in checkout.spec.ts", expected: [] },
+  { id: "cn-02", tags: ["core-only"], memories: [
+    { text: "The user's editor is Neovim.", category: PREF },
+  ], query: "refactor the auth middleware to use async/await", expected: [] },
+  { id: "cn-03", tags: ["core-only"], memories: [
+    { text: "The user prefers the arc browser.", category: PREF },
+  ], query: "bump the minor version and update the changelog", expected: [] },
+
+  // ---- none: clean no-match -------------------------------------------------
   { id: "no-01", tags: ["none"], memories: [
     { text: "The user prefers Rust for systems programming.", category: PREF },
     { text: "The user likes green.", category: PREF },

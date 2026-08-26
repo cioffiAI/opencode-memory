@@ -1,21 +1,30 @@
 import { tool } from "@opencode-ai/plugin"
-import { mkdir, open, readFile, rename, unlink, writeFile } from "fs/promises"
-import os from "os"
-import path from "path"
 import {
   addEntry,
   applyConsolidation,
+  applyIrrelevantFeedback,
+  applySurfaceFeedback,
+  applyUsefulFeedback,
+  consolidationEntries,
   coreSlot,
   DAY,
-  emptyStore,
+  extractJson,
   findSimilar,
+  findWritableTarget,
   KEYWORD_BONUS,
+  clearProjectEntries,
   norm,
-  normalizeStore,
+  parseRerankAnswer,
   prune,
+  readQuery,
+  readableEntries,
   retrieve,
   score,
+  type Entry,
+  type RankedMemory,
 } from "./core.ts"
+import { CONFIG, CONSOLIDATION_TITLE, RERANK_TITLE, SESSION_TOOLS_DENY_ALL } from "./config.ts"
+import { getState, getStore, saveState, withLock, writeStore } from "./store.ts"
 
 // ---------------------------------------------------------------------------
 // opencode long-term memory plugin (Dreaming-style)
@@ -23,62 +32,17 @@ import {
 // WRITE  — memory_* tools: the agent stores explicit facts at call time.
 // DREAM  — when a session goes idle, a HEADLESS child session (parentID set,
 //          therefore invisible in the session picker) is used to synthesize
-//          new facts / update the summary; it is deleted right after.
+//          new facts / update the summary; it is deleted right after. Child
+//          sessions run with SESSION_TOOLS_DENY_ALL: no tool of any kind is
+//          available to them (see src/config.ts for the verified contract).
 // SURFACE— a <memory> block (summary + top facts) is injected into every
 //          prompt via the system.transform hook.
+//
+// Scope & privacy policy lives in core.ts (projectVisible / readableEntries /
+// consolidationEntries / readQuery): every tool and every prompt builder goes
+// through it. Project-scoped entries never cross project directories; local-
+// only entries never reach any model-visible path.
 // ---------------------------------------------------------------------------
-
-const CONSOLIDATION_TITLE = "memory-consolidation"
-const CONFIG = {
-  off: process.env.OPENCODE_MEMORY_OFF === "1",
-  debug: process.env.OPENCODE_MEMORY_DEBUG === "1",
-  delayMs: Number(process.env.OPENCODE_MEMORY_DELAY_MS ?? 90000),
-  maxEntries: Number(process.env.OPENCODE_MEMORY_MAX_ENTRIES ?? 400),
-  maxFacts: Number(process.env.OPENCODE_MEMORY_MAX_FACTS ?? 18),
-  maxChars: Number(process.env.OPENCODE_MEMORY_MAX_CHARS ?? 2400),
-  transcriptChars: Number(process.env.OPENCODE_MEMORY_TRANSCRIPT_CHARS ?? 12000),
-  sweepIntervalMs: Number(process.env.OPENCODE_MEMORY_SWEEP_MS ?? 10 * 60 * 1000),
-  sweepStartMs: Number(process.env.OPENCODE_MEMORY_SWEEP_START_MS ?? 20000),
-  sweepBatch: Number(process.env.OPENCODE_MEMORY_SWEEP_BATCH ?? 8),
-  gcChildAgeMs: Number(process.env.OPENCODE_MEMORY_GC_CHILD_AGE_MS ?? 10 * 60 * 1000),
-  inProgressTimeoutMs: Number(process.env.OPENCODE_MEMORY_INPROGRESS_TIMEOUT_MS ?? 10 * 60 * 1000),
-  // Hybrid retrieval: optional semantic reranking stage. Off by default;
-  // when enabled it reranks the lexical candidate window through a headless
-  // LLM call, cached per query and bounded by a timeout that falls back to
-  // the lexical order on any delay.
-  rerank: process.env.OPENCODE_MEMORY_RERANK === "1",
-  rerankCandidates: Number(process.env.OPENCODE_MEMORY_RERANK_CANDIDATES ?? 30),
-  rerankTimeoutMs: Number(process.env.OPENCODE_MEMORY_RERANK_TIMEOUT_MS ?? 4000),
-  rerankCacheMs: Number(process.env.OPENCODE_MEMORY_RERANK_CACHE_MS ?? 60 * 1000),
-  coreSlot: Number(process.env.OPENCODE_MEMORY_CORE_SLOT ?? 3),
-  // Surface feedback: lastSeen/useCount of surfaced memories are persisted
-  // at most once per entry per interval, to avoid IO on every prompt.
-  surfaceRefreshMs: Number(process.env.OPENCODE_MEMORY_SURFACE_REFRESH_MS ?? 15 * 60 * 1000),
-}
-
-const DATA_DIR =
-  process.env.OPENCODE_MEMORY_DIR ?? path.join(os.homedir(), ".local", "share", "opencode", "memory")
-const STORE_FILE = path.join(DATA_DIR, "store.json")
-const STATE_FILE = path.join(DATA_DIR, "state.json")
-const SUMMARY_FILE = path.join(DATA_DIR, "SUMMARY.md")
-const LOCK_FILE = path.join(DATA_DIR, ".lock")
-
-type Entry = import("./core.ts").Entry
-type Store = import("./core.ts").Store
-type RankedMemory = import("./core.ts").RankedMemory
-
-type InProgress = {
-  targetTs: number
-  startedAt: number
-  childID?: string
-}
-
-type State = {
-  sessions: Record<string, number>
-  inProgress?: Record<string, InProgress>
-}
-
-// Single source of truth for categories lives in core.ts (CATEGORIES).
 
 function now() {
   return Date.now()
@@ -112,83 +76,6 @@ function log(
     })
     .catch(() => {})
 }
-
-// ---------------------------------------------------------------------------
-// Store I/O (atomic, cross-instance safe via lockfile)
-// ---------------------------------------------------------------------------
-
-async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  await mkdir(DATA_DIR, { recursive: true }).catch(() => {})
-  let fd: Awaited<ReturnType<typeof open>> | undefined
-  for (let i = 0; i < 40; i++) {
-    try {
-      fd = await open(LOCK_FILE, "wx")
-      break
-    } catch {
-      await sleep(50)
-    }
-  }
-  if (!fd) throw new Error("memory store lock timeout")
-  try {
-    return await fn()
-  } finally {
-    await fd.close().catch(() => {})
-    await unlink(LOCK_FILE).catch(() => {})
-  }
-}
-
-async function readJson<T>(file: string, fallback: T): Promise<T> {
-  try {
-    return JSON.parse(await readFile(file, "utf8")) as T
-  } catch {
-    return fallback
-  }
-}
-
-async function writeJson(file: string, value: unknown) {
-  await mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-  const tmp = `${file}.tmp`
-  await writeFile(tmp, JSON.stringify(value, null, 2), "utf8")
-  await rename(tmp, file)
-}
-
-// Always read the store fresh from disk: the consolidation writes it inside
-// its own lock, and a stale in-memory copy would make the consolidation
-// prompt and the dedup guard see outdated entries (or none at all).
-// No lock needed on read: writeJson uses an atomic rename, so we always see
-// a complete file (old or new version). This also avoids nested locks inside
-// the critical sections that call readStore() themselves.
-async function readStore(): Promise<Store> {
-  return normalizeStore(await readJson<Store>(STORE_FILE, emptyStore()))
-}
-
-async function getStore(): Promise<Store> {
-  return readStore()
-}
-
-async function writeStore(store: Store) {
-  await writeJson(STORE_FILE, store)
-  await writeFile(
-    SUMMARY_FILE,
-    `# opencode memory summary\n\nUpdated: ${new Date(store.updatedAt).toISOString()}\n\n${store.summary || "_No summary yet — it is generated after the first consolidation._"}\n`,
-    "utf8",
-  )
-}
-
-async function getState(): Promise<State> {
-  const state = await withLock(() => readJson<State>(STATE_FILE, { sessions: {}, inProgress: {} }))
-  state.sessions = state.sessions ?? {}
-  state.inProgress = state.inProgress ?? {}
-  return state
-}
-
-async function saveState(state: State) {
-  await withLock(() => writeJson(STATE_FILE, state))
-}
-
-// ---------------------------------------------------------------------------
-// Scoring / similarity / pruning / consolidation live in core.ts.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Consolidation (headless: child session, invisible in the session picker)
@@ -234,6 +121,10 @@ async function waitForReply(
 // "no duplicate of an explicit entry" rule (weak models, cross-language). We
 // ask a focused question in the SAME headless session and only add candidates
 // that are NOT reported as duplicates.
+//
+// Trust boundaries: the entry list shown here is restricted to the
+// consolidating project's visible entries (consolidationEntries), so neither
+// other projects' memories nor local-only facts leak into this prompt.
 async function dedupCheck(
   client: any,
   consSessionID: string,
@@ -261,7 +152,7 @@ REPLY WITH STRICT JSON ONLY:
   try {
     await client.session.promptAsync({
       path: { id: consSessionID },
-      body: { parts: [{ type: "text", text: prompt }], tools: DISABLED_TOOLS },
+      body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
     })
     const answer = await waitForReply(client, consSessionID, 90_000, { after: Date.now() })
     const parsed = extractJson(answer)
@@ -311,41 +202,6 @@ async function sessionInfo(client: any, sessionID: string) {
   log("debug", "session.get response", { sessionID, hasData: !!res?.data, hasError: !!res?.error, error: res?.error ?? undefined })
   return res?.data
 }
-
-function extractJson(text: string): any | undefined {
-  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim()
-  try {
-    const parsed = JSON.parse(trimmed)
-    if (parsed && typeof parsed === "object") return parsed
-  } catch {
-    /* fall through */
-  }
-  const start = trimmed.indexOf("{")
-  const end = trimmed.lastIndexOf("}")
-  if (start >= 0 && end > start) {
-    try {
-      return JSON.parse(trimmed.slice(start, end + 1))
-    } catch {
-      /* fall through */
-    }
-  }
-  const arrStart = trimmed.indexOf("[")
-  const arrEnd = trimmed.lastIndexOf("]")
-  if (arrStart >= 0 && arrEnd > arrStart) {
-    try {
-      return JSON.parse(trimmed.slice(arrStart, arrEnd + 1))
-    } catch {
-      /* fall through */
-    }
-  }
-  return undefined
-}
-
-// Tools disabled inside the headless consolidation session (nothing else is
-// available either — we want a pure JSON answer).
-const DISABLED_TOOLS: Record<string, boolean> = Object.fromEntries(
-  ["memory_read", "memory_write", "memory_update", "memory_forget", "memory_clear"].map((t) => [t, false]),
-)
 
 async function consolidate(sessionID: string): Promise<void> {
   log("debug", "consolidate start", { sessionID })
@@ -408,10 +264,11 @@ async function consolidate(sessionID: string): Promise<void> {
     .slice(-20)
 
   const store = await getStore()
-  // local-only facts never leave the machine: they are excluded from the
-  // consolidation prompt (the transcript itself is still processed by the
-  // provider, as documented in the README).
-  const visible = store.entries.filter((e) => e.sensitivity !== "local-only")
+  // The DREAM pipeline sees exactly what its project allows: global entries
+  // plus this session's own project, never local-only facts. The same list
+  // feeds both the prompt and the dedup pass below. The transcript itself is
+  // still processed by the provider configured in OpenCode (documented).
+  const visible = consolidationEntries(store, session.directory)
   const entriesBlock =
     visible.length === 0
       ? "(none)"
@@ -426,7 +283,7 @@ TASKS:
 2. update: only entries whose fact genuinely CHANGED in the conversation (e.g. "The user changed jobs" replaces the old one). Never use update for mere reformulation.
 3. delete: ids of entries that are outdated or contradicted.
 4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit (the user says something that invalidates it, e.g. "I always use npm" vs "from now on I use Bun everywhere"), report it here with the entry id and a short evidence quote. Never modify or delete that entry — reporting is enough; the user resolves the conflict.
-5. summary: 2-5 sentence summary of who the user is and how they like to work.
+5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data (credentials, tokens, passwords) in the summary.
 
 SOURCE HIERARCHY (critical):
 - Entries tagged source=explicit were stated directly by the user and ALWAYS win over source=dreamed (inferred) ones.
@@ -474,17 +331,21 @@ ${transcript}`
     state.inProgress![sessionID].childID = consSessionID
     await saveState(state)
 
+    // SESSION_TOOLS_DENY_ALL: the child processes untrusted conversation
+    // text with ZERO tools (shell, filesystem, network, MCP, subagents,
+    // memory tools — everything). See src/config.ts for the verified
+    // server-side contract.
     await clientRef.session.promptAsync({
       path: { id: consSessionID },
-      body: { parts: [{ type: "text", text: prompt }], tools: DISABLED_TOOLS },
+      body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
     })
     const answer = await waitForReply(clientRef, consSessionID, 120_000, { after: Date.now() })
     if (!answer) throw new Error("consolidation timed out")
     const parsed = extractJson(answer)
     if (!parsed || !Array.isArray(parsed.new)) throw new Error("consolidation returned no usable JSON")
 
-    if (Array.isArray(parsed.new) && parsed.new.length > 0 && store.entries.length > 0) {
-      const skip = await dedupCheck(clientRef, consSessionID, store.entries, parsed.new)
+    if (Array.isArray(parsed.new) && parsed.new.length > 0 && visible.length > 0) {
+      const skip = await dedupCheck(clientRef, consSessionID, visible, parsed.new)
       if (skip.size > 0) {
         log("debug", "dedup applied", { skipped: skip.size, texts: parsed.new.filter((_: any, i: number) => skip.has(i)).map((x: any) => x?.text) })
         parsed.new = parsed.new.filter((_: any, i: number) => !skip.has(i))
@@ -492,7 +353,9 @@ ${transcript}`
     }
 
     await withLock(async () => {
-      const fresh = await readStore()
+      // Fresh read inside the lock so applyConsolidation dedups against the
+      // newest on-disk state (another instance may have written meanwhile).
+      const fresh = await getStore()
       applyConsolidation(fresh, parsed, session.directory, now(), log, {
         sessionID,
         messageIDs,
@@ -520,14 +383,15 @@ ${transcript}`
   }
 }
 
-// Garbage collection of orphaned consolidation children: if the process
-// dies after creating the child but before the finally cleanup, the child
-// stays (invisible in the picker, but present). A child is removed only when
-// BOTH conditions hold: it is older than gcChildAgeMs AND shows no recent
-// activity (updated < cutoff) — a slow but live consolidation must never be
-// killed. Children referenced by a valid (unexpired) inProgress marker are
-// exempt even across processes (a second server instance must not delete the
-// child of a live one).
+// ---------------------------------------------------------------------------
+// Garbage collection of orphaned helper sessions: if the process dies after
+// creating a child but before the finally cleanup, the child stays (invisible
+// in the picker, but present). Both consolidation AND rerank children are
+// covered. A child is removed only when BOTH conditions hold: it is older
+// than gcChildAgeMs AND shows no recent activity (updated < cutoff) — a slow
+// but live helper must never be killed. Children referenced by a valid
+// (unexpired) inProgress marker are exempt even across processes (a second
+// server instance must not delete the child of a live one).
 async function gcConsolidationChildren() {
   try {
     const state = await getState()
@@ -542,7 +406,7 @@ async function gcConsolidationChildren() {
     for (const s of sessions) {
       if (consolidationIDs.has(s.id)) continue
       if (activeChildren.has(s.id)) continue
-      if (s?.title !== CONSOLIDATION_TITLE) continue
+      if (s?.title !== CONSOLIDATION_TITLE && s?.title !== RERANK_TITLE) continue
       const created = s?.time?.created ?? 0
       const updated = s?.time?.updated ?? 0
       if (created > 0 && created < cutoff && updated < cutoff) {
@@ -550,7 +414,7 @@ async function gcConsolidationChildren() {
         removed++
       }
     }
-    if (removed > 0) log("info", "gc removed orphan consolidation sessions", { removed })
+    if (removed > 0) log("info", "gc removed orphan helper sessions", { removed })
   } catch (err) {
     log("warn", "gc failed", { error: String(err) })
   }
@@ -566,9 +430,9 @@ async function sweep() {
     const candidates: any[] = []
     for (const s of sessions) {
       if (consolidationIDs.has(s.id)) continue
-      // Consolidation children are never consolidated themselves (they are
-      // handled by the GC).
-      if (s?.title === CONSOLIDATION_TITLE) continue
+      // Helper children (consolidation + rerank) are never consolidated
+      // themselves (they are handled by the GC).
+      if (s?.title === CONSOLIDATION_TITLE || s?.title === RERANK_TITLE) continue
       const lastTs = state.sessions[s.id] ?? 0
       if (lastTs !== 0) continue
       // A session with a valid (unexpired) inProgress marker is being
@@ -591,11 +455,9 @@ async function sweep() {
 // Memory block injection (proactive surfacing)
 // ---------------------------------------------------------------------------
 
-const RERANK_TITLE = "memory-surfacing"
-
 // Last retrieval snapshot per session, for the inspector's "surfaced" view.
 const lastSurface = new Map<string, RankedMemory[]>()
-const rerankCache = new Map<string, { at: number; order: string[] }>()
+const rerankCache = new Map<string, { at: number; order: string[]; abstain?: boolean }>()
 
 async function sessionTopicQuery(client: any, sessionID: string): Promise<string> {
   try {
@@ -612,8 +474,12 @@ async function sessionTopicQuery(client: any, sessionID: string): Promise<string
 }
 
 // Optional semantic stage of the hybrid pipeline: a headless LLM call reranks
-// the lexical candidate window. Cached per query, bounded by a timeout that
-// falls back to the lexical order, and disabled by default.
+// the lexical candidate window. The reranker may ABSTAIN ({"order":[]}):
+// ranking a window is not evidence that anything answers the question, and an
+// abstention surfaces nothing beyond the core slot. Cached per query, bounded
+// by a timeout that falls back to the deterministic lexical order, disabled
+// by default. Runs with zero tools (SESSION_TOOLS_DENY_ALL); candidates are
+// already filtered by scope and sensitivity upstream (retrieve()).
 async function rerankCandidates(
   client: any,
   sessionID: string,
@@ -624,7 +490,8 @@ async function rerankCandidates(
   const key = norm(query || " ")
   const cached = rerankCache.get(key)
   if (cached && now() - cached.at < CONFIG.rerankCacheMs) {
-    return applyRerankOrder(candidates, cached.order)
+    if (cached.abstain) return []
+    return applyRerankOrder(candidates, cached.order ?? [])
   }
   let childID: string | undefined
   try {
@@ -633,7 +500,11 @@ async function rerankCandidates(
     if (!childID) return candidates
     consolidationIDs.add(childID)
     const lines = candidates.map((r, i) => `[${i}] ${r.entry.text}`).join("\n")
-    const prompt = `You are a memory retrieval reranker. Rank the candidate memories by relevance to the user question, most relevant first. Use semantics, not just keywords: paraphrase and synonyms count. Reorder ALL candidates. REPLY WITH STRICT JSON ONLY: {"order":[0,2,1,...]}
+    const prompt = `You are a memory retrieval judge. Decide which candidate memories actually help answer the user's question, then rank ONLY those, most relevant first. Use semantics, not just keywords: paraphrase and synonyms count. A memory that merely shares a word or an adjacent topic but does NOT answer the question must be excluded.
+
+REPLY WITH STRICT JSON ONLY, nothing else:
+- {"order":[i,j,...]} with the indices of relevant candidates, best first (reorder ALL relevant ones)
+- {"order":[]} if NO candidate actually answers the question
 
 QUESTION: ${query || "(empty)"}
 
@@ -641,19 +512,20 @@ CANDIDATES:
 ${lines}`
     await client.session.promptAsync({
       path: { id: childID },
-      body: { parts: [{ type: "text", text: prompt }], tools: DISABLED_TOOLS },
+      body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
     })
     const answer = await Promise.race([
       waitForReply(client, childID, 90_000, { after: Date.now() }),
       sleep(CONFIG.rerankTimeoutMs).then(() => ""),
     ])
     if (!answer) return candidates
-    const parsed = extractJson(answer)
-    const order = Array.isArray(parsed?.order)
-      ? parsed.order.map(Number).filter((i: number) => Number.isInteger(i) && i >= 0 && i < candidates.length)
-      : []
-    if (order.length === 0) return candidates
-    const ids = order.map((i: number) => candidates[i].entry.id)
+    const outcome = parseRerankAnswer(answer, candidates.length)
+    if (outcome.kind === "abstain") {
+      rerankCache.set(key, { at: now(), order: [], abstain: true })
+      return []
+    }
+    if (outcome.kind === "invalid") return candidates
+    const ids = outcome.order.map((i) => candidates[i].entry.id)
     rerankCache.set(key, { at: now(), order: ids })
     return applyRerankOrder(candidates, ids)
   } catch {
@@ -678,25 +550,24 @@ function applyRerankOrder(candidates: RankedMemory[], order: string[]): RankedMe
   })
 }
 
-// Persist surface feedback (lastUsed/useCount/lastSeen) at most once per
-// entry per interval: surfaced memories stay alive through exposure without
-// writing the store on every prompt.
+// Persist surface EXPOSURE (lastSurfaced/surfacedCount/useCount) at most once
+// per entry per interval. Deliberately does NOT touch lastSeen: automatic
+// exposure is not evidence that a fact is still current, and refreshing
+// recency on every surfacing would create a self-reinforcing loop (frequently
+// surfaced memories stay artificially fresh and immortal under prune()).
+// Only explicit positive feedback (memory_useful) refreshes lastSeen.
 async function markSurfaced(ids: string[], t = now()) {
   if (ids.length === 0) return
   try {
     await withLock(async () => {
-      const s = await readStore()
-      let changed = false
-      for (const id of ids) {
+      const s = await getStore()
+      const due = ids.some((id) => {
         const e = s.entries.find((x) => x.id === id)
-        if (!e) continue
-        if (t - (e.lastUsed ?? 0) < CONFIG.surfaceRefreshMs) continue
-        e.lastUsed = t
-        e.useCount = (e.useCount ?? 0) + 1
-        e.lastSeen = t
-        changed = true
-      }
-      if (changed) await writeStore(s)
+        return !!e && t - (e.lastUsed ?? 0) >= CONFIG.surfaceRefreshMs
+      })
+      if (!due) return
+      applySurfaceFeedback(s, ids, t, CONFIG.surfaceRefreshMs)
+      await writeStore(s)
     })
   } catch (err) {
     log("debug", "markSurfaced failed", { error: String(err) })
@@ -711,6 +582,8 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
   const t = now()
 
   const query = await sessionTopicQuery(client, sessionID)
+  // retrieve() enforces scope isolation (global + this directory only) and
+  // excludes local-only entries via excludeSensitivity.
   const ranked = retrieve(store, directory, query, t, {
     excludeSensitivity: new Set(["local-only"]),
     candidateCount: CONFIG.rerankCandidates,
@@ -718,7 +591,8 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
   const reranked = CONFIG.rerank ? await rerankCandidates(client, sessionID, query, ranked) : ranked
   // Relevance floor: without RERANK, only keyword-qualified memories enter
   // the relevance tier — a query that matches nothing surfaces nothing but
-  // the core slot (no noise for off-topic prompts).
+  // the core slot (no noise for off-topic prompts). With RERANK, an explicit
+  // abstention returns [] here (same outcome, semantic gate instead).
   const qualified = CONFIG.rerank ? reranked : reranked.filter((r) => r.keywordHits > 0)
   const top = qualified.slice(0, CONFIG.maxFacts)
   const selectedIds = new Set(top.map((r) => r.entry.id))
@@ -828,22 +702,19 @@ export default async ({ client }: { client: any }) => {
     tool: {
       memory_read: tool({
         description:
-          "Read facts stored in long-term memory. Use this when you need the user's preferences, constraints, or project decisions from previous sessions (like ChatGPT's memory recall).",
+          "Read facts stored in long-term memory. Use this when you need the user's preferences, constraints, or project decisions from previous sessions (like ChatGPT's memory recall). Returns global facts plus the CURRENT project's facts; project-scoped facts from other projects are never visible.",
         args: {
           query: tool.schema.string().optional().describe("Optional text to filter facts by topic"),
           category: tool.schema.string().optional().describe("Optional category filter: user, project, workflow, preferences, decisions, status, environment, other"),
           scope: tool.schema.enum(["global", "project"]).optional().describe("Filter by scope"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           const store = await getStore()
-          const q = String(args.query ?? "").trim().toLowerCase()
-          const cat = args.category ? String(args.category) : undefined
-          const scope = args.scope === "project" ? "project" : args.scope === "global" ? "global" : undefined
-          const hits = store.entries
-            .filter((e) => (!q || e.text.toLowerCase().includes(q) || e.category.toLowerCase().includes(q)))
-            .filter((e) => !cat || e.category === cat)
-            .filter((e) => !scope || e.scope === scope)
-            .sort((a, b) => score(b) - score(a))
+          const hits = readQuery(store, ctx.directory, {
+            query: args.query ? String(args.query) : undefined,
+            category: args.category ? String(args.category) : undefined,
+            scope: args.scope === "project" ? "project" : args.scope === "global" ? "global" : undefined,
+          })
           if (hits.length === 0) return "No memory entries found."
           return [
             store.summary ? `Summary: ${store.summary}` : null,
@@ -864,7 +735,7 @@ export default async ({ client }: { client: any }) => {
           tier: tool.schema.enum(["core", "archival", "temporary"]).optional().describe("core: always surfaced; archival: surfaced on relevance (default for non-critical facts); temporary: expires automatically"),
           ttlHours: tool.schema.number().optional().describe("Lifetime in hours for tier=temporary (default 24)"),
           pinned: tool.schema.boolean().optional().describe("If true the memory never decays (e.g. identity facts)"),
-          sensitivity: tool.schema.enum(["normal", "private", "local-only"]).optional().describe("local-only: never surfaced to remote providers nor sent during consolidation; only visible through memory_read"),
+          sensitivity: tool.schema.enum(["normal", "private", "local-only"]).optional().describe("local-only: stored on disk only; never surfaced, never included in any prompt, never returned by any tool (manage via files in the memory dir)"),
         },
         async execute(args, ctx) {
           const text = String(args.fact ?? "").trim()
@@ -879,8 +750,11 @@ export default async ({ client }: { client: any }) => {
               : undefined
           let status = ""
           await withLock(async () => {
-            const fresh = await readStore()
-            const existing = findSimilar(fresh.entries, text)
+            const fresh = await getStore()
+            // Rewrite targeting is scoped: a write can only refresh an entry
+            // in the SAME scope (and same project). Cross-scope equivalents
+            // coexist by design; local-only entries are never rewrite targets.
+            const existing = findWritableTarget(fresh.entries, text, scope, ctx.directory)
             if (existing) {
               existing.text = text
               existing.source = "explicit"
@@ -929,23 +803,24 @@ export default async ({ client }: { client: any }) => {
 
       memory_update: tool({
         description:
-          "Correct an existing memory entry (e.g. the user changed jobs, moved, or a preference changed). Provide either id (from memory_read) or match text; the new fact replaces the old one. Resolves a CONFLICTED entry.",
+          "Correct an existing memory entry (e.g. the user changed jobs, moved, or a preference changed). Provide either id (from memory_read) or match text; the new fact replaces the old one. Resolves a CONFLICTED entry. Can only touch entries visible in this project.",
         args: {
           id: tool.schema.string().optional().describe("Entry id from memory_read"),
           match: tool.schema.string().optional().describe("Text of the entry to update"),
           fact: tool.schema.string().describe("The corrected fact"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           const fact = String(args.fact ?? "").trim()
           if (!fact) return "No fact provided."
           let updated = 0
           let resolvedConflict = false
           await withLock(async () => {
-            const fresh = await readStore()
+            const fresh = await getStore()
+            const visible = readableEntries(fresh, ctx.directory)
             const target = args.id
-              ? fresh.entries.find((e) => e.id === args.id)
+              ? visible.find((e) => e.id === args.id)
               : args.match
-                ? findSimilar(fresh.entries, String(args.match))
+                ? findSimilar(visible, String(args.match))
                 : undefined
             if (target) {
               target.text = fact
@@ -972,9 +847,9 @@ export default async ({ client }: { client: any }) => {
         args: {
           id: tool.schema.string().describe("Entry id from memory_read"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           const store = await getStore()
-          const e = store.entries.find((x) => x.id === args.id)
+          const e = readableEntries(store, ctx.directory).find((x) => x.id === args.id)
           if (!e) return "No memory entry with this id."
           const t = now()
           const days = Math.max(0, (t - e.lastSeen) / DAY)
@@ -1003,9 +878,11 @@ export default async ({ client }: { client: any }) => {
             lines.push("Resolve it with memory_update (new fact) or memory_write (rewrite).")
           }
           lines.push(`Weight: ${e.weight.toFixed(2)} (base importance, never decayed in place)`)
-          lines.push(`Usage: surfaced ${e.useCount ?? 0}x, helpful ${e.helpfulCount ?? 0}, irrelevant ${e.irrelevantCount ?? 0}`)
           lines.push(
-            `Score (now): ${base.toFixed(3)} = (${e.weight.toFixed(2)} + source bonus + utilization) × decay ${decay.toFixed(3)} (age ${Math.round(days)}d)`,
+            `Usage: surfaced ${e.surfacedCount ?? 0}x (last ${e.lastSurfaced ? new Date(e.lastSurfaced).toISOString() : "never"}), helpful ${e.helpfulCount ?? 0}, irrelevant ${e.irrelevantCount ?? 0}`,
+          )
+          lines.push(
+            `Score (now): ${base.toFixed(3)} = (${e.weight.toFixed(2)} + source bonus + utilization) × decay ${decay.toFixed(3)} (age since last confirmation ${Math.round(days)}d)`,
           )
           for (const [sid, ranked] of lastSurface) {
             const hit = ranked.find((r) => r.entry.id === e.id)
@@ -1024,52 +901,55 @@ export default async ({ client }: { client: any }) => {
 
       memory_inspect: tool({
         description:
-          "Inspect the memory store: stats (counts by source/scope/tier/status, context cost), recent entries, conflicts awaiting resolution, project-scoped entries, or the 'why surfaced' breakdown of the current session's retrieval.",
+          "Inspect the memory store: stats (counts by source/scope/tier/status, context cost), recent entries, conflicts awaiting resolution, project-scoped entries, or the 'why surfaced' breakdown of the current session's retrieval. All views are limited to entries visible in this project.",
         args: {
           show: tool.schema.enum(["stats", "recent", "conflicts", "project", "surfaced"]).optional().describe("View to show (default stats)"),
           limit: tool.schema.number().optional().describe("Max entries in list views (default 10)"),
         },
         async execute(args, ctx) {
           const store = await getStore()
+          // Every view operates on the readable subset: global + current
+          // project, never local-only, never another project's entries.
+          const s = readableEntries(store, ctx.directory)
+          const full = store
           const show = args.show ?? "stats"
           const limit = Math.max(1, Math.min(50, Number(args.limit ?? 10)))
           const out: string[] = []
           if (show === "stats") {
-            const s = store
-            const explicit = s.entries.filter((e) => e.source === "explicit").length
-            const dreamed = s.entries.filter((e) => e.source === "dreamed").length
-            const global = s.entries.filter((e) => e.scope === "global").length
-            const project = s.entries.filter((e) => e.scope === "project").length
-            const core = s.entries.filter((e) => e.tier === "core").length
-            const archival = s.entries.filter((e) => e.tier === "archival").length
-            const temporary = s.entries.filter((e) => e.tier === "temporary").length
-            const pinned = s.entries.filter((e) => e.pinned).length
-            const conflicted = s.entries.filter((e) => e.status === "CONFLICTED").length
-            const superseded = s.entries.filter((e) => e.status === "SUPERSEDED").length
-            const localOnly = s.entries.filter((e) => e.sensitivity === "local-only").length
-            const privateCount = s.entries.filter((e) => e.sensitivity === "private").length
-            const avgChars = s.entries.length ? Math.round(s.entries.reduce((a, e) => a + e.text.length, 0) / s.entries.length) : 0
+            const explicit = s.filter((e) => e.source === "explicit").length
+            const dreamed = s.filter((e) => e.source === "dreamed").length
+            const global = s.filter((e) => e.scope === "global").length
+            const project = s.filter((e) => e.scope === "project").length
+            const core = s.filter((e) => e.tier === "core").length
+            const archival = s.filter((e) => e.tier === "archival").length
+            const temporary = s.filter((e) => e.tier === "temporary").length
+            const pinned = s.filter((e) => e.pinned).length
+            const conflicted = s.filter((e) => e.status === "CONFLICTED").length
+            const superseded = s.filter((e) => e.status === "SUPERSEDED").length
+            const privateCount = s.filter((e) => e.sensitivity === "private").length
+            const avgChars = s.length ? Math.round(s.reduce((a, e) => a + e.text.length, 0) / s.length) : 0
             const catCounts = new Map<string, number>()
-            for (const e of s.entries) catCounts.set(e.category, (catCounts.get(e.category) ?? 0) + 1)
-            out.push("OpenCode Memory")
+            for (const e of s) catCounts.set(e.category, (catCounts.get(e.category) ?? 0) + 1)
+            out.push("OpenCode Memory (visible in this project)")
             out.push("")
-            out.push(`Stored: ${s.entries.length}   Explicit: ${explicit}   Dreamed: ${dreamed}`)
+            out.push(`Stored: ${s.length}   Explicit: ${explicit}   Dreamed: ${dreamed}`)
             out.push(`Global: ${global}   Project: ${project}`)
             out.push(`Tier: core ${core} | archival ${archival} | temporary ${temporary} | pinned ${pinned}`)
             out.push(`Status: conflicted ${conflicted} | superseded (tombstones) ${superseded}`)
-            out.push(`Sensitivity: local-only ${localOnly} | private ${privateCount}`)
+            out.push(`Sensitivity: private ${privateCount}`)
             out.push(`Categories: ${[...catCounts.entries()].map(([c, n]) => `${c} ${n}`).join(", ")}`)
-            out.push(`Summary: ${s.summary.length} chars   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((s.summary.length + s.entries.reduce((a, e) => a + e.text.length, 0)) / 4)} tokens`)
+            out.push(`Summary: ${full.summary.length} chars   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((full.summary.length + s.reduce((a, e) => a + e.text.length, 0)) / 4)} tokens`)
             const totalSurface = [...lastSurface.values()].reduce((a, r) => a + r.length, 0)
-            out.push(`Surfaced in last prompts: ${totalSurface}/${s.entries.length}`)
+            out.push(`Surfaced in last prompts: ${totalSurface}/${s.length}`)
+            out.push("(local-only entries are never listed here; manage them via the files in the memory dir)")
           } else if (show === "recent") {
-            const list = [...store.entries].sort((a, b) => b.created - a.created).slice(0, limit)
+            const list = [...s].sort((a, b) => b.created - a.created).slice(0, limit)
             out.push(`Recent ${list.length} entries:`)
             for (const e of list) {
               out.push(`- [${e.id}] (${e.scope}/${e.category}, ${e.source}${e.status === "CONFLICTED" ? ", conflicted" : ""}) ${e.text}`)
             }
           } else if (show === "conflicts") {
-            const list = store.entries.filter((e) => e.status === "CONFLICTED")
+            const list = s.filter((e) => e.status === "CONFLICTED")
             if (list.length === 0) {
               out.push("No conflicts awaiting resolution.")
             } else {
@@ -1081,8 +961,8 @@ export default async ({ client }: { client: any }) => {
             }
           } else if (show === "project") {
             const dir = ctx.directory
-            const list = store.entries.filter((e) => e.scope === "project").slice(0, limit)
-            out.push(`Project entries (directory: ${dir ?? "unknown"}) — ${list.length}/${store.entries.filter((e) => e.scope === "project").length}:`)
+            const list = s.filter((e) => e.scope === "project" && e.projectID === dir).slice(0, limit)
+            out.push(`Project entries (directory: ${dir ?? "unknown"}) — ${list.length}/${s.filter((e) => e.scope === "project").length}:`)
             for (const e of list) {
               out.push(`- [${e.id}] (${e.category}, ${e.source}) ${e.text}`)
             }
@@ -1110,64 +990,61 @@ export default async ({ client }: { client: any }) => {
       }),
 
       memory_useful: tool({
-        description: "Tell the memory system that a surfaced memory was actually useful. Improves its future ranking and slows its decay.",
+        description: "Tell the memory system that a surfaced memory was actually useful. Improves its future ranking, slows its decay and counts as a confirmation that the fact is still current.",
         args: {
           id: tool.schema.string().describe("Entry id from memory_read"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           let ok = false
           await withLock(async () => {
-            const fresh = await readStore()
-            const target = fresh.entries.find((e) => e.id === args.id)
-            if (target) {
-              target.helpfulCount = (target.helpfulCount ?? 0) + 1
-              target.useCount = (target.useCount ?? 0) + 1
-              target.lastUsed = now()
-              target.lastSeen = now()
-              ok = true
+            const fresh = await getStore()
+            const visible = readableEntries(fresh, ctx.directory)
+            if (!visible.some((e) => e.id === args.id)) return
+            ok = applyUsefulFeedback(fresh, args.id, now())
+            if (ok) {
+              fresh.updatedAt = now()
+              await writeStore(fresh)
             }
-            fresh.updatedAt = now()
-            await writeStore(fresh)
           })
           return ok ? "Noted as useful." : "No memory entry with this id."
         },
       }),
 
       memory_irrelevant: tool({
-        description: "Tell the memory system that a surfaced memory was NOT relevant to the current task. Lowers its future ranking.",
+        description: "Tell the memory system that a surfaced memory was NOT relevant to the current task. Lowers its future ranking. Does not affect factual recency.",
         args: {
           id: tool.schema.string().describe("Entry id from memory_read"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           let ok = false
           await withLock(async () => {
-            const fresh = await readStore()
-            const target = fresh.entries.find((e) => e.id === args.id)
-            if (target) {
-              target.irrelevantCount = (target.irrelevantCount ?? 0) + 1
-              target.useCount = (target.useCount ?? 0) + 1
-              target.lastUsed = now()
-              ok = true
+            const fresh = await getStore()
+            const visible = readableEntries(fresh, ctx.directory)
+            if (!visible.some((e) => e.id === args.id)) return
+            ok = applyIrrelevantFeedback(fresh, args.id, now())
+            if (ok) {
+              fresh.updatedAt = now()
+              await writeStore(fresh)
             }
-            fresh.updatedAt = now()
-            await writeStore(fresh)
           })
           return ok ? "Noted as irrelevant." : "No memory entry with this id."
         },
       }),
 
       memory_forget: tool({
-        description: "Remove a fact from long-term memory. Provide either id (from memory_read) or text to match.",
+        description: "Remove a fact from long-term memory. Provide either id (from memory_read) or text to match. Can only remove entries visible in this project.",
         args: {
           id: tool.schema.string().optional().describe("Entry id from memory_read"),
           match: tool.schema.string().optional().describe("Text of the entry to delete"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           let removed = 0
           await withLock(async () => {
-            const fresh = await readStore()
+            const fresh = await getStore()
+            const forgettable = new Set(readableEntries(fresh, ctx.directory).map((e) => e.id))
             const before = fresh.entries.length
             fresh.entries = fresh.entries.filter((e) => {
+              if (!forgettable.has(e.id)) return true
               if (args.id && e.id === args.id) return false
               if (args.match) {
                 const m = String(args.match).toLowerCase()
@@ -1185,17 +1062,19 @@ export default async ({ client }: { client: any }) => {
       }),
 
       memory_clear: tool({
-        description: "Delete all stored memory (or only 'global'/'project' scoped facts).",
+        description: "Delete stored memory. With scope='project' removes ONLY this project's memories (other projects keep theirs); scope='global' clears shared facts; no argument wipes everything including local-only entries.",
         args: {
           scope: tool.schema.enum(["global", "project"]).optional().describe("Only clear this scope; default clears everything"),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           let removed = 0
           await withLock(async () => {
-            const fresh = await readStore()
+            const fresh = await getStore()
             const before = fresh.entries.length
-            if (args.scope) {
-              fresh.entries = fresh.entries.filter((e) => e.scope !== args.scope)
+            if (args.scope === "project") {
+              removed = clearProjectEntries(fresh, ctx.directory)
+            } else if (args.scope === "global") {
+              fresh.entries = fresh.entries.filter((e) => e.scope !== "global")
               removed = before - fresh.entries.length
             } else {
               fresh.entries = []

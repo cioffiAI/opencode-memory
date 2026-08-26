@@ -36,8 +36,13 @@ export type Entry = {
   lastUsed?: number
   helpfulCount?: number
   irrelevantCount?: number
-  // Privacy (v2): local-only facts are never surfaced to remote providers
-  // nor included in consolidation prompts.
+  // Exposure tracking (v1.5.1): automatic surfacing is NOT evidence that a
+  // fact is still current, so it must never touch `lastSeen`. Exposure is
+  // recorded separately and feeds statistics only (never the score).
+  lastSurfaced?: number
+  surfacedCount?: number
+  // Privacy (v2): local-only facts are stored on disk only; they never reach
+  // any model-visible path (see readableEntries / consolidationEntries).
   sensitivity?: "normal" | "private" | "local-only"
 }
 
@@ -160,6 +165,188 @@ export function topicClash(a: string, b: string): boolean {
   return ta.some((t) => set.has(t))
 }
 
+// ---------------------------------------------------------------------------
+// Scope & privacy policy (single source of truth)
+//
+// Every code path that reads, lists, mutates or exposes entries MUST go
+// through these predicates instead of re-implementing scope checks:
+//
+//   projectVisible(e, dir) — a project-scoped entry belongs to exactly one
+//     project directory; global entries are visible everywhere.
+//   isLocalOnly(e)         — local-only entries live on disk only. They are
+//     excluded from every model-visible path: SURFACE injection, DREAM
+//     prompts (entries list AND dedup prompt), semantic rerank candidates,
+//     summaries-by-construction, tool responses (memory_read/why/inspect),
+//     and every mutating tool (update/forget/feedback). The only supported
+//     access path is direct file inspection of OPENCODE_MEMORY_DIR by the
+//     human user.
+// ---------------------------------------------------------------------------
+
+export function projectVisible(e: Entry, directory: string | undefined): boolean {
+  return e.scope === "global" || (e.scope === "project" && !!directory && e.projectID === directory)
+}
+
+export function isLocalOnly(e: Entry): boolean {
+  return e.sensitivity === "local-only"
+}
+
+// Entries a model-facing tool may return or mutate in this context:
+// global + current project, never local-only.
+export function readableEntries(store: Store, directory: string | undefined): Entry[] {
+  return store.entries.filter((e) => projectVisible(e, directory) && !isLocalOnly(e))
+}
+
+// Entries the DREAM pipeline may use (prompt entriesBlock, dedup targets,
+// update/delete/conflict resolution): same visibility as tools, because the
+// consolidation session is an untrusted child that must not see or modify
+// anything outside its own project either.
+export function consolidationEntries(store: Store, directory: string | undefined): Entry[] {
+  return readableEntries(store, directory)
+}
+
+// In-place rewrite target for memory_write: restricted to the SAME scope (and
+// same project for scope=project). A global fact and an equivalent project
+// fact may coexist by design; neither suppresses the other.
+export function findWritableTarget(
+  entries: Entry[],
+  text: string,
+  scope: Entry["scope"],
+  directory: string | undefined,
+  threshold = 0.6,
+): Entry | undefined {
+  const candidates = entries.filter((e) => !isLocalOnly(e) && e.scope === scope && (scope === "global" || e.projectID === directory))
+  return findSimilar(candidates, text, threshold)
+}
+
+// memory_read policy: filter + search within the readable set only.
+export function readQuery(
+  store: Store,
+  directory: string | undefined,
+  opts: { query?: string; category?: string; scope?: "global" | "project" } = {},
+): Entry[] {
+  const q = String(opts.query ?? "").trim().toLowerCase()
+  return readableEntries(store, directory)
+    .filter((e) => (!q || e.text.toLowerCase().includes(q) || e.category.toLowerCase().includes(q)))
+    .filter((e) => !opts.category || e.category === opts.category)
+    .filter((e) => !opts.scope || e.scope === opts.scope)
+    .sort((a, b) => score(b) - score(a))
+}
+
+// memory_clear(scope="project") removes ONLY the current project's entries —
+// never another project's project-scoped memories. Returns the removed count.
+export function clearProjectEntries(store: Store, directory: string | undefined): number {
+  const before = store.entries.length
+  store.entries = store.entries.filter((e) => !(e.scope === "project" && !!directory && e.projectID === directory))
+  return before - store.entries.length
+}
+
+// Automatic exposure bookkeeping. Updates ONLY exposure/usage counters, at
+// most once per entry per minIntervalMs. It deliberately does NOT touch
+// `lastSeen`: being surfaced is not evidence that a fact is still true, and
+// letting it refresh recency would create a self-reinforcing loop where
+// frequently ranked memories stay artificially fresh (and immortal under
+// prune()). Explicit positive feedback (applyUsefulFeedback) IS treated as
+// confirmation because the user affirms the fact through their agent.
+export function applySurfaceFeedback(store: Store, ids: string[], t = Date.now(), minIntervalMs = 0): void {
+  for (const id of ids) {
+    const e = store.entries.find((x) => x.id === id)
+    if (!e) continue
+    if (minIntervalMs > 0 && t - (e.lastUsed ?? 0) < minIntervalMs) continue
+    e.lastSurfaced = t
+    e.surfacedCount = (e.surfacedCount ?? 0) + 1
+    e.useCount = (e.useCount ?? 0) + 1
+    e.lastUsed = t
+  }
+}
+
+// Explicit positive feedback: counts as confirmation (refreshes lastSeen).
+export function applyUsefulFeedback(store: Store, id: string, t = Date.now()): boolean {
+  const e = store.entries.find((x) => x.id === id)
+  if (!e) return false
+  e.helpfulCount = (e.helpfulCount ?? 0) + 1
+  e.useCount = (e.useCount ?? 0) + 1
+  e.lastUsed = t
+  e.lastSeen = t
+  return true
+}
+
+// Negative feedback lowers ranking but says nothing about factual currency.
+export function applyIrrelevantFeedback(store: Store, id: string, t = Date.now()): boolean {
+  const e = store.entries.find((x) => x.id === id)
+  if (!e) return false
+  e.irrelevantCount = (e.irrelevantCount ?? 0) + 1
+  e.useCount = (e.useCount ?? 0) + 1
+  e.lastUsed = t
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Structured-answer parsing for headless helper sessions (rerank/dedup).
+// Pure so it stays directly unit-testable.
+// ---------------------------------------------------------------------------
+
+export function extractJson(text: string): any | undefined {
+  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim()
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (parsed && typeof parsed === "object") return parsed
+  } catch {
+    /* fall through */
+  }
+  const start = trimmed.indexOf("{")
+  const end = trimmed.lastIndexOf("}")
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(trimmed.slice(start, end + 1))
+    } catch {
+      /* fall through */
+    }
+  }
+  const arrStart = trimmed.indexOf("[")
+  const arrEnd = trimmed.lastIndexOf("]")
+  if (arrStart >= 0 && arrEnd > arrStart) {
+    try {
+      return JSON.parse(trimmed.slice(arrStart, arrEnd + 1))
+    } catch {
+      /* fall through */
+    }
+  }
+  return undefined
+}
+
+export type RerankOutcome =
+  | { kind: "order"; order: number[] }
+  | { kind: "abstain" }
+  | { kind: "invalid" }
+
+// Parse a reranker answer. An explicit empty {"order":[]} means the model
+// found NO relevant candidate (abstain): ranking a window is not evidence
+// that anything in it answers the question. Unparseable output is "invalid"
+// and must fall back to the deterministic lexical order.
+export function parseRerankAnswer(text: string, candidateCount: number): RerankOutcome {
+  const parsed = extractJson(text)
+  if (!parsed || !Array.isArray(parsed.order)) return { kind: "invalid" }
+  if (parsed.order.length === 0) return { kind: "abstain" }
+  const order = parsed.order
+    .map(Number)
+    .filter((i: number) => Number.isInteger(i) && i >= 0 && i < candidateCount)
+  return { kind: "order", order }
+}
+
+export function applyRerankOrderAnswer(candidates: RankedMemory[], outcome: RerankOutcome): RankedMemory[] {
+  if (outcome.kind === "abstain") return []
+  if (outcome.kind === "invalid") return candidates
+  const pos = new Map(outcome.order.map((i, rank) => [candidates[i]?.entry.id, rank]))
+  return [...candidates].sort((a, b) => {
+    const pa = pos.get(a.entry.id)
+    const pb = pos.get(b.entry.id)
+    if (pa === undefined && pb === undefined) return b.base - a.base
+    if (pa === undefined) return 1
+    if (pb === undefined) return -1
+    return pa - pb
+  })
+}
+
 export function addEntry(store: Store, e: Omit<Entry, "id" | "created"> & { created?: number }) {
   store.entries.push({
     ...e,
@@ -207,12 +394,19 @@ export function applyConsolidation(
   log?: (level: LogLevel, message: string, extra?: Record<string, unknown>) => void,
   source?: ConsolidationSource,
 ) {
+  // Trust boundary: the consolidation model only ever saw entries visible in
+  // ITS project context (global + own project, never local-only — see
+  // consolidationEntries()). Every lookup below is therefore restricted to
+  // that same set, so output referring to other projects' or local-only ids
+  // (hallucinated or hostile) cannot suppress, merge with, replace,
+  // supersede or flag them.
+  const visible = () => store.entries.filter((e) => projectVisible(e, projectID) && !isLocalOnly(e))
   for (const item of parsed.new ?? []) {
     if (!item || typeof item.text !== "string" || !item.text.trim()) continue
     const text = item.text.trim()
     const scope: Entry["scope"] = item.scope === "project" ? "project" : "global"
     const category = typeof item.category === "string" && CATEGORIES.includes(item.category) ? item.category : "other"
-    const existing = findSimilar(store.entries, text, 0.5)
+    const existing = findSimilar(visible(), text, 0.5)
     const confidence =
       typeof item.confidence === "number" && item.confidence >= 0 && item.confidence <= 1 ? item.confidence : undefined
     if (existing) {
@@ -232,8 +426,9 @@ export function applyConsolidation(
       if (scope === "project" && !existing.projectID) existing.projectID = projectID
     } else {
       // Topic-level guard: same category + shared content word → treat as
-      // duplicate of an explicit fact even across languages.
-      const clash = store.entries.find(
+      // duplicate of an explicit fact even across languages. Restricted to
+      // the consolidation-visible set (own project + global).
+      const clash = visible().find(
         (e) => e.source === "explicit" && e.category === category && topicClash(e.text, text),
       )
       if (clash) {
@@ -259,7 +454,11 @@ export function applyConsolidation(
   }
   for (const item of parsed.update ?? []) {
     if (!item || typeof item.text !== "string" || !item.text.trim()) continue
-    const target = item.id ? store.entries.find((e) => e.id === item.id) : item.match ? findSimilar(store.entries, String(item.match)) : undefined
+    const target = item.id
+      ? visible().find((e) => e.id === item.id)
+      : item.match
+        ? findSimilar(visible(), String(item.match))
+        : undefined
     // Inferences never rewrite explicit facts: only memory_update/forget do.
     if (target && target.source !== "explicit") {
       target.text = item.text.trim()
@@ -272,15 +471,18 @@ export function applyConsolidation(
   for (const item of parsed.delete ?? []) {
     if (typeof item !== "string") continue
     const del = item.trim()
-    const target = store.entries.find((e) => e.id === del)
+    const target = visible().find((e) => e.id === del)
     if (target && target.source !== "explicit") {
       // Dreamed entries are never hard-deleted by consolidation: they become
       // SUPERSEDED tombstones (auditable, pruned after the grace period).
       target.status = "SUPERSEDED"
       target.supersededAt = t
     } else {
+      const deletable = new Set(visible().filter((e) => e.source !== "explicit").map((e) => e.id))
       store.entries = store.entries.filter(
-        (e) => e.source === "explicit" || (e.id !== del && !(del.length > 3 && e.text.toLowerCase().includes(del.toLowerCase()))),
+        (e) =>
+          !deletable.has(e.id) ||
+          (e.id !== del && !(del.length > 3 && e.text.toLowerCase().includes(del.toLowerCase()))),
       )
     }
   }
@@ -289,7 +491,7 @@ export function applyConsolidation(
   // their behalf) resolves it via memory_update / memory_write.
   for (const c of parsed.conflicts ?? []) {
     if (!c || typeof c.id !== "string") continue
-    const target = store.entries.find((e) => e.id === c.id)
+    const target = visible().find((e) => e.id === c.id)
     if (!target) continue
     const evidence = typeof c.evidence === "string" ? c.evidence.slice(0, 500) : ""
     target.status = "CONFLICTED"
@@ -319,6 +521,11 @@ const STOPWORDS = new Set([
   "uscire", "entrare", "i", "you", "we", "they", "he", "she", "it", "me", "us", "them", "him", "her", "my", "your",
   "our", "their", "this", "that", "these", "those", "please", "hello", "hi", "ok", "thanks", "thank", "there",
   "their", "about", "into", "onto", "over", "under", "between", "from", "after", "before", "during", "against",
+  // Generic subject words: nearly every stored fact begins with "The user
+  // ..." / "L'utente ...", so treating them as topic keywords made ANY query
+  // mentioning them match EVERY entry, silently defeating the relevance gate
+  // (found by the v1.5.1 falsifiable benchmark).
+  "user", "users", "utente", "utenti",
 ])
 
 // Permanent core: operative preferences always surfaced regardless of topic.
@@ -387,7 +594,8 @@ export type RankedMemory = {
 
 export type RetrieveOptions = {
   // Excluded sensitivity levels: entries with these values are never
-  // returned (surface excludes "local-only"; memory_read excludes none).
+  // returned. SURFACE passes {"local-only"}; model-facing tools exclude
+  // local-only unconditionally via readableEntries()/readQuery().
   excludeSensitivity?: Set<Entry["sensitivity"]>
   // Candidate window handed to the (optional) semantic reranker.
   candidateCount?: number
