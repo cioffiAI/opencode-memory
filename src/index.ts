@@ -12,9 +12,7 @@ import {
   findSimilar,
   findWritableTarget,
   KEYWORD_BONUS,
-  clearProjectEntries,
-  norm,
-  parseRerankAnswer,
+  clearProjectEntries,  parseRerankAnswer,
   passesRelevanceGate,
   prune,
   readQuery,
@@ -25,6 +23,7 @@ import {
   type RankedMemory,
 } from "./core.ts"
 import { CONFIG, CONSOLIDATION_TITLE, RERANK_TITLE, SESSION_TOOLS_DENY_ALL } from "./config.ts"
+import { rerankCandidates } from "./rerank.ts"
 import { getState, getStore, saveState, withLock, writeStore } from "./store.ts"
 
 // ---------------------------------------------------------------------------
@@ -458,7 +457,6 @@ async function sweep() {
 
 // Last retrieval snapshot per session, for the inspector's "surfaced" view.
 const lastSurface = new Map<string, RankedMemory[]>()
-const rerankCache = new Map<string, { at: number; order: string[]; abstain?: boolean }>()
 
 async function sessionTopicQuery(client: any, sessionID: string): Promise<string> {
   try {
@@ -474,80 +472,23 @@ async function sessionTopicQuery(client: any, sessionID: string): Promise<string
   }
 }
 
-// Optional semantic stage of the hybrid pipeline: a headless LLM call reranks
-// the lexical candidate window. The reranker may ABSTAIN ({"order":[]}):
-// ranking a window is not evidence that anything answers the question, and an
-// abstention surfaces nothing beyond the core slot. Cached per query, bounded
-// by a timeout that falls back to the deterministic lexical order, disabled
-// by default. Runs with zero tools (SESSION_TOOLS_DENY_ALL); candidates are
-// already filtered by scope and sensitivity upstream (retrieve()).
-async function rerankCandidates(
+// Optional semantic stage lives in src/rerank.ts (injectable client, unit-
+// tested mechanism: abstention, invalid-answer and timeout fall back to the
+// deterministic lexical order; zero-tool containment; local-only filtering).
+async function rerankCandidatesSafe(
   client: any,
   sessionID: string,
   query: string,
   candidates: RankedMemory[],
 ): Promise<RankedMemory[]> {
-  if (candidates.length <= 1) return candidates
-  const key = norm(query || " ")
-  const cached = rerankCache.get(key)
-  if (cached && now() - cached.at < CONFIG.rerankCacheMs) {
-    if (cached.abstain) return []
-    return applyRerankOrder(candidates, cached.order ?? [])
-  }
-  let childID: string | undefined
-  try {
-    const created = await client.session.create({ body: { title: RERANK_TITLE, parentID: sessionID } })
-    childID = created?.data?.id
-    if (!childID) return candidates
-    consolidationIDs.add(childID)
-    const lines = candidates.map((r, i) => `[${i}] ${r.entry.text}`).join("\n")
-    const prompt = `You are a memory retrieval judge. Decide which candidate memories actually help answer the user's question, then rank ONLY those, most relevant first. Use semantics, not just keywords: paraphrase and synonyms count. A memory that merely shares a word or an adjacent topic but does NOT answer the question must be excluded.
-
-REPLY WITH STRICT JSON ONLY, nothing else:
-- {"order":[i,j,...]} with the indices of relevant candidates, best first (reorder ALL relevant ones)
-- {"order":[]} if NO candidate actually answers the question
-
-QUESTION: ${query || "(empty)"}
-
-CANDIDATES:
-${lines}`
-    await client.session.promptAsync({
-      path: { id: childID },
-      body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
-    })
-    const answer = await Promise.race([
-      waitForReply(client, childID, 90_000, { after: Date.now() }),
-      sleep(CONFIG.rerankTimeoutMs).then(() => ""),
-    ])
-    if (!answer) return candidates
-    const outcome = parseRerankAnswer(answer, candidates.length)
-    if (outcome.kind === "abstain") {
-      rerankCache.set(key, { at: now(), order: [], abstain: true })
-      return []
-    }
-    if (outcome.kind === "invalid") return candidates
-    const ids = outcome.order.map((i) => candidates[i].entry.id)
-    rerankCache.set(key, { at: now(), order: ids })
-    return applyRerankOrder(candidates, ids)
-  } catch {
-    return candidates
-  } finally {
-    if (childID) {
-      consolidationIDs.delete(childID)
-      await clientRef.session.delete({ path: { id: childID } }).catch(() => {})
-    }
-  }
-}
-
-function applyRerankOrder(candidates: RankedMemory[], order: string[]): RankedMemory[] {
-  const pos = new Map(order.map((id, i) => [id, i]))
-  return [...candidates].sort((a, b) => {
-    const pa = pos.get(a.entry.id)
-    const pb = pos.get(b.entry.id)
-    if (pa === undefined && pb === undefined) return b.base - a.base
-    if (pa === undefined) return 1
-    if (pb === undefined) return -1
-    return pa - pb
+  return rerankCandidates(client, sessionID, query, candidates, {
+    timeoutMs: CONFIG.rerankTimeoutMs,
+    cacheMs: CONFIG.rerankCacheMs,
+    log,
+    onChildCreated: (id) => consolidationIDs.add(id),
+  }, async (childID) => {
+    consolidationIDs.delete(childID)
+    await client.session.delete({ path: { id: childID } }).catch(() => {})
   })
 }
 
@@ -589,7 +530,7 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
     excludeSensitivity: new Set(["local-only"]),
     candidateCount: CONFIG.rerankCandidates,
   })
-  const reranked = CONFIG.rerank ? await rerankCandidates(client, sessionID, query, ranked) : ranked
+  const reranked = CONFIG.rerank ? await rerankCandidatesSafe(client, sessionID, query, ranked) : ranked
   // Relevance floor: without RERANK, only memories passing the lexical
   // relevance gate enter the relevance tier — a query that matches nothing
   // surfaces nothing but the core slot (no noise for off-topic prompts).
