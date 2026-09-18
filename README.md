@@ -271,8 +271,9 @@ at-least-once consolidation semantics are unaffected.
 
 ```bash
 bun install
-bun run check   # typecheck + tests + build
-bun run bench   # retrieval benchmark
+bun run check           # typecheck + tests + build
+bun run verify:package  # build + pack + isolated install + tool assertion
+bun run bench           # retrieval benchmark
 npm pack --dry-run
 ```
 

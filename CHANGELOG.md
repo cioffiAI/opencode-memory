@@ -6,7 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [1.6.0] — 2026-08-26
 
 Retrieval Evaluation / Relevance. Retrieval semantics change (user-visible);
-API compatible. No new features; no new dependencies.
+API compatible. No new features; no new packages (the plugin's runtime
+dependency is now declared correctly, see below).
 
 ### Fixed
 
@@ -22,6 +23,13 @@ API compatible. No new features; no new dependencies.
 - **camelCase identifiers tokenize correctly**: the boundary splitter only
   splits at lowercase→uppercase transitions ("RAM", "GB" stay whole;
   "userStore"/"JavaScript" produce both parts and the whole form).
+- **Runtime dependency declared (issues #2/#3).** `@opencode-ai/plugin` is
+  imported at load time by the published `dist/index.js`, so it moved from
+  `devDependencies` to `dependencies`: a clean install of the tarball now
+  resolves it. New release gate `bun run verify:package` (wired into
+  `prepublishOnly`) builds, packs, installs the tarball outside the checkout,
+  imports it by package name, asserts the nine `memory_*` tools are
+  registered and calls `dispose()` to release the timers.
 
 ### Changed
 
