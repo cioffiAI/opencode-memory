@@ -18,6 +18,12 @@ dependency is now declared correctly, see below).
   `UI`, `DB`, `C`, `R`, `no`, `C++`, `C#`, `Node.js`, `.NET`). No stemming,
   synonyms or accent folding; scope/category filters, score ordering and the
   privacy policy are unchanged. Covered by `tests/read-query.test.ts`.
+- **Identifier tokenization is symmetric in `memory_read`.** Query and memory
+  go through the same word grammar: a camelCase identifier matches its compact
+  form OR all of its case-boundary parts, so `JavaScript` matches both
+  "JavaScript" and "javascript"/"java script" and `userStore` matches
+  "user store" (one half alone never satisfies it; query casing cannot change
+  the outcome). Same coverage in `tests/read-query.test.ts`.
 - **Unsafe substring matching removed.** The matcher now respects token
   boundaries: `use` no longer matches `user`, `test` no longer matches
   `pytest`/`greatest`, `red` no longer matches `redesign`. Confirmed by the
@@ -72,8 +78,9 @@ dependency is now declared correctly, see below).
 | FPR held-out | 46.7% (7/15) | 26.7% (4/15) |
 | False abstentions (dev) | 26.0% (20/77) | 31.2% (24/77) |
 
-The three new false abstentions (kw-02, co-05, ob-05) all relied on the same
-removed noise bridge (`use` prefix-matching the universal "user" token).
+The four new false abstentions (kw-02, pa-10, co-05, ob-05) all relied on the
+removed substring behavior: `use` matching inside the universal "user" token
+(kw-02, co-05, ob-05) and `uni` matching inside "university" (pa-10).
 All 13 remaining dev-set failures are exact-token or true-translation matches
 whose intent differs — documented as the lexical ceiling; embeddings are NOT
 yet justified by this evidence.

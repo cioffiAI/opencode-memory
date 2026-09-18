@@ -102,10 +102,13 @@ plugin, and the automatic DREAM cycle runs regardless.
 `memory_read` uses its own conservative lexical search: the historical
 contiguous substring match is preserved, plus an all-terms path where every
 term of a multi-word query must appear as a whole token (any order,
-non-contiguous) in the text or category. Short and technical terms are kept
-(`AI`, `UI`, `DB`, `C`, `R`, `no`, `C++`, `C#`, `Node.js`, `.NET`); no
-stemming, synonyms or accent folding. Scope/category filters, score ordering
-and privacy rules are identical to the rest of the plugin.
+non-contiguous) in the text or category. Query and memory go through the same
+identifier grammar: a camelCase word matches either its compact or its
+separated spelling (`JavaScript` ↔ `javascript` / `java script`, never one
+half alone). Short and technical terms are kept (`AI`, `UI`, `DB`, `C`, `R`,
+`no`, `C++`, `C#`, `Node.js`, `.NET`); no stemming, synonyms or accent
+folding. Scope/category filters, score ordering and privacy rules are
+identical to the rest of the plugin.
 
 Example of `memory_why`:
 

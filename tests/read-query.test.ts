@@ -3,9 +3,9 @@
 // src/core.ts readQuery(): the legacy contiguous substring path is preserved
 // and a whole-token AND path is added for multi-word queries. Grammar choices
 // (technical identifiers, accents, separators, camelCase) are documented and
-// tested in the `queryTerms grammar` block below.
+// tested in the `queryTermGroups grammar` block below.
 import { describe, expect, test } from "bun:test"
-import { emptyStore, queryTerms, readQuery, type Entry, type Store } from "../src/core.ts"
+import { emptyStore, queryTermGroups, readQuery, type Entry, type Store } from "../src/core.ts"
 
 const PROJ_A = "/workspace/project-a"
 const PROJ_B = "/workspace/project-b"
@@ -83,6 +83,16 @@ const CONTRACT: Array<{ name: string; text: string; query: string; expected: boo
   { name: "snake_case identifier splits", text: "The flag is OPENCODE_MEMORY_DIR.", query: "memory dir", expected: true },
   { name: "hyphenated compound splits", text: "The user builds AI-powered tools.", query: "AI tools", expected: true },
 
+  // identifier case symmetry (query and memory go through the same grammar)
+  { name: "camelCase query against separated words", text: "The user store caches sessions.", query: "userStore", expected: true },
+  { name: "camelCase query with another term", text: "The userStore caches sessions.", query: "userStore sessions", expected: true },
+  { name: "camelCase identifier in a multi-word query", text: "JavaScript is my preferred language.", query: "JavaScript language", expected: true },
+  { name: "lowercase query against camelCase memory", text: "JavaScript is my preferred language.", query: "javascript language", expected: true },
+  { name: "uppercase query against camelCase memory", text: "JavaScript is my preferred language.", query: "JAVASCRIPT language", expected: true },
+  { name: "mixed-case query against lowercase memory", text: "javascript is my preferred language.", query: "JavaScript language", expected: true },
+  { name: "single camelCase word matches its compact form", text: "JavaScript is my preferred language.", query: "JavaScript", expected: true },
+  { name: "all identifier parts must be present", text: "The user writes java code.", query: "JavaScript language", expected: false },
+
   // category is a match surface for terms too
   { name: "query matches text and category together", text: "The user likes coffee.", query: "coffee preferences", expected: true, category: "preferences" },
   { name: "legacy category substring", text: "A stored fact.", query: "pref", expected: true, category: "preferences" },
@@ -151,13 +161,13 @@ describe("readQuery multi-term keeps privacy and filters intact", () => {
   })
 })
 
-describe("queryTerms grammar (documented, tested choices)", () => {
+describe("queryTermGroups grammar (documented, tested choices)", () => {
   test("technical identifiers stay distinct", () => {
-    expect(queryTerms("C++ C# Node.js .NET")).toEqual(["c++", "c#", "node.js", "net"])
+    expect(queryTermGroups("C++ C# Node.js .NET").map((g) => g.whole)).toEqual(["c++", "c#", "node.js", "net"])
   })
 
   test("separators split terms; punctuation-only fragments disappear", () => {
-    expect(queryTerms("coffee, morning\tAI-powered memory_read ???")).toEqual([
+    expect(queryTermGroups("coffee, morning\tAI-powered memory_read ???").map((g) => g.whole)).toEqual([
       "coffee",
       "morning",
       "ai",
@@ -167,11 +177,15 @@ describe("queryTerms grammar (documented, tested choices)", () => {
     ])
   })
 
-  test("camelCase splits at case boundaries", () => {
-    expect(queryTerms("userStore")).toEqual(["user", "store"])
+  test("camelCase keeps the compact form and the parts as alternatives", () => {
+    expect(queryTermGroups("userStore")).toEqual([{ whole: "userstore", parts: ["user", "store"] }])
+  })
+
+  test("plain words have a single form", () => {
+    expect(queryTermGroups("coffee")).toEqual([{ whole: "coffee", parts: ["coffee"] }])
   })
 
   test("accents are preserved, not folded", () => {
-    expect(queryTerms("caffè caffè")).toEqual(["caffè"])
+    expect(queryTermGroups("caffè caffè").map((g) => g.whole)).toEqual(["caffè"])
   })
 })

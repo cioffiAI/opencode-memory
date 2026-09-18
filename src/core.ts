@@ -244,13 +244,21 @@ export function findWritableTarget(
 // ---------------------------------------------------------------------------
 // memory_read query grammar (issue #4). Legacy contiguous substring semantics
 // are KEPT as the first path (a query like "coff" still matches "coffee", and
-// category substrings still match); a second path requires ALL query terms to
-// be present as whole tokens, in any order and non-contiguous, in the entry
-// text or category. This makes "coffee morning" match "coffee in the
-// morning" without the issue patch's regressions: short terms are never
-// dropped ("AI", "UI", "DB", "C", "R", "no" stay meaningful) and token
-// boundaries are respected, so "AI models" does not match "statistical
-// models" and "C compiler" does not match "Rust compiler".
+// category substrings still match); a second path requires EVERY query word to
+// be satisfied by the entry text or category, in any order and non-contiguous.
+// This makes "coffee morning" match "coffee in the morning" without the issue
+// patch's regressions: short terms are never dropped ("AI", "UI", "DB", "C",
+// "R", "no" stay meaningful) and token boundaries are respected, so "AI
+// models" does not match "statistical models".
+//
+// Identifier symmetry: a query word is one group of alternative spellings —
+// its compact form AND its case-boundary parts. A camelCase word matches when
+// the entry has the compact form OR all of its parts, so every direction works:
+// "JavaScript" matches "javascript is my preferred language." (compact),
+// "javascript" matches "JavaScript is ..." (parts), and "userStore" matches
+// "user store" (parts) — while "java" alone never satisfies "JavaScript".
+// Query and entry are tokenized through the SAME word grammar, so casing of
+// the query (lower/upper/mixed) can no longer change the outcome.
 //
 // Deliberately NOT reused here: tokens() folds accents and strips identifier
 // punctuation (C++ -> "c"), and topicKeywords() drops terms <= 2 chars. This
@@ -259,32 +267,71 @@ export function findWritableTarget(
 // and underscores as separators (AI-powered -> AI + powered). It is lexical
 // only: no stemming, synonyms, semantic search or query operators.
 // ---------------------------------------------------------------------------
-export function queryTerms(query: string): string[] {
-  const terms = new Set<string>()
-  const matches = query.normalize("NFC").match(/[\p{L}\p{N}][\p{L}\p{N}+#.]*/gu) ?? []
-  for (const raw of matches) {
-    // Trailing sentence punctuation ("coffee." / "morning.") is not part of
-    // the token; edge dots are never meaningful (".NET." -> "net"). The
-    // symbols that distinguish identifiers (+, #, inner dots) are preserved.
-    const clean = raw.replace(/^\.+|\.+$/g, "")
-    if (!clean) continue
-    // Same case-boundary rule as tokens(): split at lower→upper transitions
-    // ("userStore" -> user + store); the parts ARE the matching terms, so a
-    // query identifier and its separated spelling find each other.
-    const parted = clean.replace(/([\p{Ll}])([\p{Lu}])/gu, "$1 $2").toLowerCase().split(/\s+/)
-    for (const part of parted) if (part) terms.add(part)
+
+// One query word and the spellings that satisfy it. `whole` is the compact
+// lowercased form; `parts` are its case-boundary parts. For a word without a
+// case boundary the two coincide.
+export type QueryTermGroup = {
+  whole: string
+  parts: string[]
+}
+
+function wordForms(raw: string): QueryTermGroup | undefined {
+  // Trailing sentence punctuation ("coffee." / "morning.") is not part of
+  // the word; edge dots are never meaningful (".NET." -> "net"). The symbols
+  // that distinguish identifiers (+, #, inner dots) are preserved instead.
+  const clean = raw.replace(/^\.+|\.+$/g, "")
+  if (!clean) return undefined
+  // Same case-boundary rule as tokens(): split at lower→upper transitions
+  // ("userStore" -> user + store).
+  const parts = clean
+    .replace(/([\p{Ll}])([\p{Lu}])/gu, "$1 $2")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+  return { whole: clean.toLowerCase(), parts }
+}
+
+export function queryTermGroups(query: string): QueryTermGroup[] {
+  const groups: QueryTermGroup[] = []
+  const seen = new Set<string>()
+  for (const raw of query.normalize("NFC").match(/[\p{L}\p{N}][\p{L}\p{N}+#.]*/gu) ?? []) {
+    const group = wordForms(raw)
+    if (!group || seen.has(group.whole)) continue
+    seen.add(group.whole)
+    groups.push(group)
   }
-  return [...terms]
+  return groups
+}
+
+// Vocabulary a text exposes to the token-AND path: every word as its compact
+// form AND its case-boundary parts, so an identifier can be found through
+// either spelling.
+function entryVocabulary(text: string): Set<string> {
+  const vocabulary = new Set<string>()
+  for (const raw of text.normalize("NFC").match(/[\p{L}\p{N}][\p{L}\p{N}+#.]*/gu) ?? []) {
+    const group = wordForms(raw)
+    if (!group) continue
+    vocabulary.add(group.whole)
+    for (const part of group.parts) vocabulary.add(part)
+  }
+  return vocabulary
+}
+
+function groupMatches(group: QueryTermGroup, vocabulary: Set<string>): boolean {
+  // Compact form first; otherwise ALL parts of the identifier must be
+  // present, so one half never satisfies a camelCase word by itself.
+  return vocabulary.has(group.whole) || group.parts.every((part) => vocabulary.has(part))
 }
 
 // Path 1 preserves the historical substring semantics exactly; path 2 is the
-// token-boundary AND described above. An empty term list (punctuation-only
+// token-boundary AND described above. An empty group list (punctuation-only
 // query) disables path 2 so it can never collapse into "match everything".
-function matchesQuery(e: Entry, q: string, terms: string[]): boolean {
+function matchesQuery(e: Entry, q: string, groups: QueryTermGroup[]): boolean {
   if (e.text.toLowerCase().includes(q) || e.category.toLowerCase().includes(q)) return true
-  if (terms.length === 0) return false
-  const entryTerms = new Set([...queryTerms(e.text), ...queryTerms(e.category)])
-  return terms.every((t) => entryTerms.has(t))
+  if (groups.length === 0) return false
+  const vocabulary = entryVocabulary(`${e.text} ${e.category}`)
+  return groups.every((group) => groupMatches(group, vocabulary))
 }
 
 // memory_read policy: filter + search within the readable set only.
@@ -293,10 +340,13 @@ export function readQuery(
   directory: string | undefined,
   opts: { query?: string; category?: string; scope?: "global" | "project" } = {},
 ): Entry[] {
-  const q = String(opts.query ?? "").trim().toLowerCase()
-  const terms = q ? queryTerms(q) : []
+  // The raw (case-preserving) query feeds the identifier grammar; only the
+  // legacy substring path uses the lowercased form.
+  const raw = String(opts.query ?? "").trim()
+  const q = raw.toLowerCase()
+  const groups = raw ? queryTermGroups(raw) : []
   return readableEntries(store, directory)
-    .filter((e) => !q || matchesQuery(e, q, terms))
+    .filter((e) => !q || matchesQuery(e, q, groups))
     .filter((e) => !opts.category || e.category === opts.category)
     .filter((e) => !opts.scope || e.scope === opts.scope)
     .sort((a, b) => score(b) - score(a))
