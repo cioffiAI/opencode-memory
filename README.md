@@ -91,13 +91,21 @@ plugin, and the automatic DREAM cycle runs regardless.
 
 | Tool | Purpose |
 | --- | --- |
-| `memory_read` | Search facts (query / category / scope); global + current project only |
+| `memory_read` | Search facts (query / category / scope); multi-word queries match all terms; global + current project only |
 | `memory_write` | Store an explicit fact (`tier`, `ttlHours`, `pinned`, `sensitivity`) |
 | `memory_update` | Correct a fact, by `id` or match — resolves CONFLICTED entries |
 | `memory_forget` / `memory_clear` | Remove facts (scoped to what is visible in this project) |
 | `memory_why` | Audit a memory: provenance, lifecycle, score breakdown |
 | `memory_inspect` | `stats` \| `recent` \| `conflicts` \| `project` \| `surfaced` |
 | `memory_useful` / `memory_irrelevant` | Feedback on retrieval quality |
+
+`memory_read` uses its own conservative lexical search: the historical
+contiguous substring match is preserved, plus an all-terms path where every
+term of a multi-word query must appear as a whole token (any order,
+non-contiguous) in the text or category. Short and technical terms are kept
+(`AI`, `UI`, `DB`, `C`, `R`, `no`, `C++`, `C#`, `Node.js`, `.NET`); no
+stemming, synonyms or accent folding. Scope/category filters, score ordering
+and privacy rules are identical to the rest of the plugin.
 
 Example of `memory_why`:
 

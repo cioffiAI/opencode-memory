@@ -241,6 +241,52 @@ export function findWritableTarget(
   return findSimilar(candidates, text, threshold)
 }
 
+// ---------------------------------------------------------------------------
+// memory_read query grammar (issue #4). Legacy contiguous substring semantics
+// are KEPT as the first path (a query like "coff" still matches "coffee", and
+// category substrings still match); a second path requires ALL query terms to
+// be present as whole tokens, in any order and non-contiguous, in the entry
+// text or category. This makes "coffee morning" match "coffee in the
+// morning" without the issue patch's regressions: short terms are never
+// dropped ("AI", "UI", "DB", "C", "R", "no" stay meaningful) and token
+// boundaries are respected, so "AI models" does not match "statistical
+// models" and "C compiler" does not match "Rust compiler".
+//
+// Deliberately NOT reused here: tokens() folds accents and strips identifier
+// punctuation (C++ -> "c"), and topicKeywords() drops terms <= 2 chars. This
+// grammar keeps technical identifiers distinct (C++ vs C#, Node.js, .NET),
+// does not fold accents ("caffe" must not match "caffè"), and treats hyphens
+// and underscores as separators (AI-powered -> AI + powered). It is lexical
+// only: no stemming, synonyms, semantic search or query operators.
+// ---------------------------------------------------------------------------
+export function queryTerms(query: string): string[] {
+  const terms = new Set<string>()
+  const matches = query.normalize("NFC").match(/[\p{L}\p{N}][\p{L}\p{N}+#.]*/gu) ?? []
+  for (const raw of matches) {
+    // Trailing sentence punctuation ("coffee." / "morning.") is not part of
+    // the token; edge dots are never meaningful (".NET." -> "net"). The
+    // symbols that distinguish identifiers (+, #, inner dots) are preserved.
+    const clean = raw.replace(/^\.+|\.+$/g, "")
+    if (!clean) continue
+    // Same case-boundary rule as tokens(): split at lower→upper transitions
+    // ("userStore" -> user + store); the parts ARE the matching terms, so a
+    // query identifier and its separated spelling find each other.
+    const parted = clean.replace(/([\p{Ll}])([\p{Lu}])/gu, "$1 $2").toLowerCase().split(/\s+/)
+    for (const part of parted) if (part) terms.add(part)
+  }
+  return [...terms]
+}
+
+// Path 1 preserves the historical substring semantics exactly; path 2 is the
+// token-boundary AND described above. An empty term list (punctuation-only
+// query) disables path 2 so it can never collapse into "match everything".
+function matchesQuery(e: Entry, q: string, terms: string[]): boolean {
+  if (e.text.toLowerCase().includes(q) || e.category.toLowerCase().includes(q)) return true
+  if (terms.length === 0) return false
+  const entryTerms = new Set([...queryTerms(e.text), ...queryTerms(e.category)])
+  return terms.every((t) => entryTerms.has(t))
+}
+
 // memory_read policy: filter + search within the readable set only.
 export function readQuery(
   store: Store,
@@ -248,8 +294,9 @@ export function readQuery(
   opts: { query?: string; category?: string; scope?: "global" | "project" } = {},
 ): Entry[] {
   const q = String(opts.query ?? "").trim().toLowerCase()
+  const terms = q ? queryTerms(q) : []
   return readableEntries(store, directory)
-    .filter((e) => (!q || e.text.toLowerCase().includes(q) || e.category.toLowerCase().includes(q)))
+    .filter((e) => !q || matchesQuery(e, q, terms))
     .filter((e) => !opts.category || e.category === opts.category)
     .filter((e) => !opts.scope || e.scope === opts.scope)
     .sort((a, b) => score(b) - score(a))

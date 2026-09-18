@@ -11,6 +11,13 @@ dependency is now declared correctly, see below).
 
 ### Fixed
 
+- **`memory_read` multi-term queries (issue #4).** `readQuery` keeps the
+  legacy contiguous substring match and adds an all-terms whole-token path:
+  `coffee morning` matches "coffee in the morning" (any order,
+  non-contiguous) while short and technical terms are not dropped (`AI`,
+  `UI`, `DB`, `C`, `R`, `no`, `C++`, `C#`, `Node.js`, `.NET`). No stemming,
+  synonyms or accent folding; scope/category filters, score ordering and the
+  privacy policy are unchanged. Covered by `tests/read-query.test.ts`.
 - **Unsafe substring matching removed.** The matcher now respects token
   boundaries: `use` no longer matches `user`, `test` no longer matches
   `pytest`/`greatest`, `red` no longer matches `redesign`. Confirmed by the
