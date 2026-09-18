@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.6.0] — 2026-08-26
+## [1.6.0] — 2026-09-18
 
 Retrieval Evaluation / Relevance. Retrieval semantics change (user-visible);
 API compatible. No new features; no new packages (the plugin's runtime
