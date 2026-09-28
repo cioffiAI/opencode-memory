@@ -29,8 +29,8 @@ WRITE → DREAM → SURFACE lifecycle:
   model-visible path (see [Privacy](#privacy) for the exact threat model)
 - Global and project-scoped memories with enforced per-directory isolation,
   cross-language semantic deduplication
-- Headless child-session consolidation running with **zero tools**
-  (allow-none), orphan GC and crash recovery
+- Tool-free internal generation for DREAM, dedup and reranking (V2), plus
+  allow-none headless helper sessions with orphan GC (V1)
 
 ## Project scope semantics
 
@@ -57,16 +57,26 @@ single policy in `src/core.ts` (`projectVisible`, `readableEntries`,
 ## Installation
 
 Add the package to your OpenCode configuration (`~/.config/opencode/opencode.json`
-or `opencode.jsonc`):
+or `opencode.jsonc`). OpenCode V2 uses `plugins`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
+  "plugins": [
     "@cioffi_ai/opencode-memory"
   ]
 }
 ```
+
+OpenCode V1 uses the singular `plugin` key instead. The npm package exposes
+separate V1 and V2 runtime adapters from one entrypoint; both use the same
+store format and memory model. The V1 compatibility adapter requires OpenCode
+1.18.29 or newer. Version 1.7.0 adds V2 support and targets OpenCode 2.0.18+.
+Older V1 installations should upgrade OpenCode before upgrading this plugin.
+
+V2 exposes plugin tools through its Code Mode catalog by default (for example,
+`tools.memory_read(...)` inside `execute`). This is normal: the nine memory
+tools need not appear as nine standalone model tool definitions.
 
 OpenCode installs npm plugins automatically via Bun on startup and caches them
 in `~/.cache/opencode/node_modules/`. Restart OpenCode after adding the entry.
@@ -148,7 +158,7 @@ frequently-surfaced memory immortal under pruning. Negative feedback
 | `OPENCODE_MEMORY_RERANK_CACHE_MS` | 60000 | Per-query rerank cache lifetime. |
 | `OPENCODE_MEMORY_CORE_SLOT` | 3 | Core-tier entries always injected beyond relevance matches. |
 | `OPENCODE_MEMORY_SURFACE_REFRESH_MS` | 900000 | Min interval between two exposure-counter updates for the same entry. |
-| `OPENCODE_MEMORY_GC_CHILD_AGE_MS` | 600000 | Min age of an orphan child session before auto-removal. |
+| `OPENCODE_MEMORY_GC_CHILD_AGE_MS` | 600000 | V1 only: min age of an orphan helper session before auto-removal. V2 creates no helper sessions. |
 | `OPENCODE_MEMORY_INPROGRESS_TIMEOUT_MS` | 600000 | Expiry of the `inProgress` marker (crash recovery). |
 
 ## Retrieval semantics (v1.6)
@@ -263,15 +273,18 @@ Two limitations remain, by architecture rather than by omission:
 
 ## DREAM containment
 
-Consolidation, semantic dedup and semantic rerank run in headless child
-sessions that process untrusted conversation text. Those sessions are created
-with a single wildcard tool denial (`tools: { "*": false }`), which — verified
-against the OpenCode server source (v1.18.0 through v1.18.20) — removes ALL
-tools from the model-visible toolset: shell execution, file editing, network
-fetch, MCP tools, subagents, memory tools, and tools contributed by any other
-plugin. The child receives only the textual prompt and returns text; it cannot
-execute side effects. Crash recovery (inProgress markers), orphan GC and
-at-least-once consolidation semantics are unaffected.
+On OpenCode V2, consolidation, semantic dedup and semantic rerank use
+`ctx.generate.text()`. The V2 API performs an isolated text generation without
+creating a session, exposing tools, or writing conversation history. There are
+therefore no helper sessions to hide or garbage-collect. A periodic recovery
+pass uses the durable two-phase `inProgress` journal to retry interrupted
+consolidations after the configured timeout.
+
+On OpenCode V1, the same jobs run in headless child sessions created with a
+single wildcard tool denial (`tools: { "*": false }`). This removes shell,
+file, network, MCP, subagent, memory and third-party plugin tools from the
+model-visible toolset. Crash recovery, orphan GC and at-least-once
+consolidation semantics remain enabled for V1.
 
 ## Roadmap
 
@@ -283,10 +296,26 @@ at-least-once consolidation semantics are unaffected.
 ```bash
 bun install
 bun run check           # typecheck + tests + build
-bun run verify:package  # build + pack + isolated install + tool assertion
+bun run verify:package  # pack + clean install + V1/V2 tool/runtime checks
 bun run bench           # retrieval benchmark
 npm pack --dry-run
 ```
+
+To check the actual packaged artifact in both CLI generations, point the check
+at existing CLI binaries (it never downloads or replaces a CLI):
+
+```bash
+OPENCODE_TEST_BIN_V1=/path/to/opencode-v1 \
+OPENCODE_TEST_BIN_V2=/path/to/opencode-v2 \
+  bun run verify:package
+```
+
+The runtime check uses separate temporary profiles and a deterministic model
+served on localhost; no AI credentials or paid model calls are needed. It checks
+loading, all nine tool registrations, write/read, context injection, automatic
+DREAM, store migration and local-only privacy. Logs and request evidence stay in
+the printed temporary directory. The default unit test suite does not replace
+these opt-in runtime checks.
 
 ## License
 
