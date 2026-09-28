@@ -27,6 +27,9 @@ const cliEnv = {
   XDG_DATA_HOME: join(root, "data"), XDG_CONFIG_HOME: join(root, "config"),
   XDG_CACHE_HOME: join(root, "cache"), XDG_STATE_HOME: join(root, "state"),
   OPENCODE_CONFIG: join(configDir, "opencode.json"),
+  // Only the locally configured test model is needed. Avoid catalog/update
+  // network requests while booting an otherwise empty CLI profile.
+  OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_AUTOUPDATE: "1",
   OPENCODE_SERVER_USERNAME: "opencode", OPENCODE_SERVER_PASSWORD: password,
   OPENCODE_MEMORY_DIR: memory, OPENCODE_MEMORY_DELAY_MS: "100",
   OPENCODE_MEMORY_SWEEP_START_MS: "600000", OPENCODE_MEMORY_DEBUG: "1",
