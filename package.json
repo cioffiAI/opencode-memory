@@ -1,25 +1,30 @@
 {
   "name": "@cioffi_ai/opencode-memory",
-  "version": "1.6.0",
-  "description": "Local-first persistent memory for OpenCode using a WRITE \u2192 DREAM \u2192 SURFACE lifecycle.",
+  "version": "1.7.0",
+  "description": "Local-first persistent memory for OpenCode using a WRITE → DREAM → SURFACE lifecycle.",
   "type": "module",
   "main": "./dist/index.js",
-  "exports": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./server.js"
+  },
   "files": [
     "dist",
+    "server.js",
     "commands",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external \"@opencode-ai/plugin\"",
+    "build": "bun run clean && bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external \"@opencode-ai/plugin\" --external \"@opencode/plugin\"",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "bench": "bun run bench/run.ts",
     "verify:package": "bun run scripts/verify-package.ts",
     "check": "bun run typecheck && bun run test && bun run build",
-    "prepublishOnly": "bun run check && bun run verify:package"
+    "prepublishOnly": "bun run check && bun run verify:package",
+    "verify:runtime": "bun run scripts/verify-runtime.ts"
   },
   "keywords": [
     "opencode",
@@ -41,7 +46,8 @@
   },
   "homepage": "https://github.com/cioffiAI/opencode-memory#readme",
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.0"
+    "@opencode-ai/plugin": "^1.18.29",
+    "@opencode/plugin": "^2.0.18"
   },
   "devDependencies": {
     "@types/bun": "latest",

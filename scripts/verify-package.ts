@@ -11,7 +11,7 @@
 //   2. pack                     (bun pm pack: the actual tarball)
 //   3. isolated install         (fresh temp dir OUTSIDE the checkout)
 //   4. import by package name   (resolution happens against the install dir)
-//   5. initialize + dispose     (the nine tools are registered, timers freed)
+//   5. initialize V1 + V2       (both adapters register nine tools and clean up)
 //
 // Run with: bun run verify:package   (also part of prepublishOnly)
 //
@@ -50,12 +50,12 @@ function step(message: string) {
 }
 
 // Executed by the isolated install: imports the package BY NAME (so Node/Bun
-// resolves `@opencode-ai/plugin` inside the install dir), initializes the
-// plugin with a minimal client and an isolated memory dir, asserts the tool
-// surface, then disposes.
+// resolves both runtime SDKs inside the install dir), exercises the V1
+// server() adapter and the V2 setup() adapter, then disposes both.
 const CHECK_SCRIPT = `
-import { readFileSync } from "node:fs"
-import plugin from "${PKG_NAME}"
+ import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+ import plugin from "${PKG_NAME}"
+ import serverPlugin from "${PKG_NAME}/server"
 
 const EXPECTED = ${JSON.stringify(EXPECTED_TOOLS)}
 const manifest = JSON.parse(readFileSync("node_modules/${PKG_NAME}/package.json", "utf8"))
@@ -63,9 +63,39 @@ if (!manifest.dependencies?.["@opencode-ai/plugin"]) {
   console.error("FAIL: installed package does not declare @opencode-ai/plugin in dependencies")
   process.exit(1)
 }
+if (!manifest.dependencies?.["@opencode/plugin"]) {
+  console.error("FAIL: installed package does not declare @opencode/plugin in dependencies")
+  process.exit(1)
+}
+if (plugin.id !== "cioffi.opencode-memory" || typeof plugin.setup !== "function" || typeof plugin.server !== "function") {
+  console.error("FAIL: package does not expose the V2 id/setup plus V1 server contract")
+  process.exit(1)
+}
+if (serverPlugin.id !== plugin.id || typeof serverPlugin.setup !== "function") {
+  console.error("FAIL: conventional V2 ./server export is unavailable")
+  process.exit(1)
+}
+
+const memoryDir = process.env.OPENCODE_MEMORY_DIR
+mkdirSync(memoryDir, { recursive: true })
+writeFileSync(memoryDir + "/store.json", JSON.stringify({
+  version: 1,
+  summary: "",
+  updatedAt: 0,
+  entries: [{
+    id: "legacy-1",
+    text: "The user prefers a dark terminal.",
+    category: "preferences",
+    scope: "global",
+    weight: 3,
+    created: Date.now(),
+    lastSeen: Date.now(),
+    source: "explicit"
+  }]
+}))
 
 const client = { app: { log: async () => {} } }
-const instance = await plugin({ client })
+const instance = await plugin.server({ client })
 
 const actual = Object.keys(instance.tool ?? {}).sort()
 const expected = [...EXPECTED].sort()
@@ -83,7 +113,74 @@ for (const [name, t] of Object.entries(instance.tool)) {
 }
 
 await instance.dispose()
-console.log("OK: " + actual.length + " tools registered, dispose() completed")
+console.log("OK V1: " + actual.length + " tools registered, dispose() completed")
+
+const v2Tools = []
+const hooks = {}
+const subscribe = async function* ({ signal } = {}) {
+  if (signal?.aborted) return
+  await new Promise((resolve) => signal?.addEventListener("abort", resolve, { once: true }))
+}
+const v2ctx = {
+  app: { name: "opencode", version: "2.0.11", channel: "test" },
+  location: { directory: process.cwd(), project: { id: "project", directory: process.cwd(), canonical: process.cwd() } },
+  options: {},
+  tool: {
+    transform: async (callback) => {
+      callback({ add: (definition) => v2Tools.push(definition) })
+      return { dispose: async () => {} }
+    },
+    list: async () => v2Tools.map((tool) => ({ ...tool, id: tool.name })),
+  },
+  session: {
+    hook: async (name, callback) => {
+      hooks[name] = callback
+      return { dispose: async () => {} }
+    },
+    get: async ({ sessionID }) => ({
+      id: sessionID,
+      projectID: "project",
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: Date.now(), updated: Date.now() },
+      location: { directory: process.cwd() },
+    }),
+    context: async () => [{ id: "m1", type: "user", text: "coffee morning", time: { created: Date.now() } }],
+  },
+  event: { subscribe },
+  generate: { text: async () => ({ text: '{"new":[],"summary":""}' }) },
+}
+
+const cleanup = await plugin.setup(v2ctx)
+const v2Names = v2Tools.map((tool) => tool.name).sort()
+if (JSON.stringify(v2Names) !== JSON.stringify(expected)) {
+  console.error("FAIL: V2 registered tools mismatch")
+  console.error("  expected:", expected.join(", "))
+  console.error("  actual:  ", v2Names.join(", "))
+  process.exit(1)
+}
+const write = v2Tools.find((tool) => tool.name === "memory_write")
+const read = v2Tools.find((tool) => tool.name === "memory_read")
+const toolContext = { sessionID: "s-v2", agent: "build", messageID: "m-v2", id: "call-v2", signal: new AbortController().signal, progress: async () => {} }
+await write.execute({ fact: "The user drinks coffee in the morning.", category: "preferences" }, toolContext)
+const result = await read.execute({ query: "coffee morning" }, toolContext)
+if (!String(result.content).includes("coffee in the morning")) {
+  console.error("FAIL: V2 memory_write/memory_read round trip failed", result)
+  process.exit(1)
+}
+const migrated = JSON.parse(readFileSync(memoryDir + "/store.json", "utf8"))
+if (migrated.version !== 2 || migrated.entries.find((entry) => entry.id === "legacy-1")?.tier !== "core") {
+  console.error("FAIL: installed package did not migrate the V1 store to V2")
+  process.exit(1)
+}
+const event = { sessionID: "s-v2", system: [], messages: [], tools: {}, options: {}, agent: "build", model: { providerID: "test", id: "test" } }
+await hooks.context(event)
+if (!event.system.some((part) => part.type === "text" && part.text.includes("<memory>"))) {
+  console.error("FAIL: V2 context hook did not inject memory")
+  process.exit(1)
+}
+await cleanup?.()
+console.log("OK V2: " + v2Names.length + " tools, migration/read/write/context hook, cleanup completed")
 `
 
 const artifactsDir = mkdtempSync(join(tmpdir(), "opencode-memory-artifacts-"))
@@ -113,10 +210,21 @@ try {
   )
   run(["bun", "add", tarball], installDir)
 
-  step("import, initialize, assert tools, dispose")
+  step("import, exercise V1 and V2 adapters, dispose")
   writeFileSync(join(installDir, "check.mjs"), CHECK_SCRIPT)
   const out = run(["bun", "check.mjs"], installDir, { OPENCODE_MEMORY_DIR: join(installDir, "memory") })
   process.stdout.write(out)
+
+  for (const major of ["1", "2"]) {
+    const binary = process.env[`OPENCODE_TEST_BIN_V${major}`]
+    if (!binary) continue
+    step(`real OpenCode V${major} against the installed tarball`)
+    process.stdout.write(run(["bun", join(ROOT, "scripts", "verify-runtime.ts")], ROOT, {
+      OPENCODE_TEST_BIN: binary,
+      OPENCODE_TEST_MAJOR: major,
+      OPENCODE_TEST_PACKAGE: join(installDir, "node_modules", PKG_NAME),
+    }))
+  }
 
   step("OK — the tarball runs standalone")
   ok = true

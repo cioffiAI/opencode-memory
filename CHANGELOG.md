@@ -3,6 +3,37 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] — 2026-09-28
+
+OpenCode V2 compatibility (issue #6), retaining OpenCode V1 1.18.29+ support.
+
+### Added
+
+- Native OpenCode V2 adapter with `id`/`setup`, event subscription, context
+  hook and all nine `memory_*` tools registered through JSON Schema.
+- One hybrid package entrypoint: OpenCode V2 uses `setup`, while OpenCode V1
+  1.18.29+ uses `server`; both adapters share the 1.6 store and core logic.
+- Clean-install checks for both runtime contracts and a dedicated V2 test for
+  DREAM consolidation, context injection, privacy and disposal.
+- Opt-in real CLI checks with isolated profiles and a deterministic local model,
+  including tool execution, automatic consolidation and legacy store migration.
+
+### Fixed
+
+- OpenCode V2 no longer rejects the package's default export at startup.
+- V2 DREAM listens to native `session.execution.*` completion events as well
+  as the legacy idle event. Events without a directory are checked against the
+  session's project before scheduling consolidation.
+- V2 unload and partial setup failure dispose tool and context registrations.
+
+### Changed
+
+- V2 DREAM, semantic deduplication and reranking use isolated
+  `ctx.generate.text()` calls, which create no helper sessions and expose no
+  tools. V1 keeps its existing allow-none child-session implementation.
+- Package metadata now exposes the conventional `./server` entrypoint needed
+  when OpenCode V2 loads an installed package directory directly.
+
 ## [1.6.0] — 2026-09-18
 
 Retrieval Evaluation / Relevance. Retrieval semantics change (user-visible);
