@@ -22,9 +22,16 @@ import {
   type Entry,
   type RankedMemory,
 } from "./core.ts"
-import { CONFIG, CONSOLIDATION_TITLE, RERANK_TITLE, SESSION_TOOLS_DENY_ALL } from "./config.ts"
+import { CONSOLIDATION_TITLE, RERANK_TITLE, SESSION_TOOLS_DENY_ALL, resolveConfig, type MemoryConfig } from "./config.ts"
 import { rerankCandidates } from "./rerank.ts"
-import { getState, getStore, saveState, withLock, writeStore } from "./store.ts"
+import { createStore } from "./store.ts"
+
+// V1 invokes server() once per plugin location. Keep all runtime state and
+// storage bindings inside that instance so project options cannot bleed into
+// another location served by the same process.
+function createLegacyPlugin(CONFIG: MemoryConfig) {
+const { getState, getStore, saveState, withLock, writeStore } = createStore(CONFIG.dir)
+const rerankCache = new Map<string, { at: number; order: string[]; abstain?: boolean }>()
 
 // ---------------------------------------------------------------------------
 // opencode long-term memory plugin (Dreaming-style)
@@ -186,7 +193,7 @@ async function pump() {
 }
 
 function scheduleConsolidation(sessionID: string) {
-  if (CONFIG.off) return
+  if (CONFIG.off || !CONFIG.dream) return
   if (consolidationIDs.has(sessionID)) return
   const existing = debounces.get(sessionID)
   if (existing) clearTimeout(existing)
@@ -421,7 +428,7 @@ async function gcConsolidationChildren() {
 }
 
 async function sweep() {
-  if (CONFIG.off) return
+  if (CONFIG.off || !CONFIG.dream) return
   await gcConsolidationChildren()
   try {
     const res = await clientRef.session.list({ query: {} })
@@ -484,6 +491,7 @@ async function rerankCandidatesSafe(
   return rerankCandidates(client, sessionID, query, candidates, {
     timeoutMs: CONFIG.rerankTimeoutMs,
     cacheMs: CONFIG.rerankCacheMs,
+    cache: rerankCache,
     log,
     onChildCreated: (id) => consolidationIDs.add(id),
   }, async (childID) => {
@@ -587,29 +595,30 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
 // Plugin
 // ---------------------------------------------------------------------------
 
-export default async ({ client }: { client: any }) => {
+return async ({ client }: { client: any }) => {
   clientRef = client
   if (CONFIG.off) {
-    log("info", "memory disabled via OPENCODE_MEMORY_OFF=1")
+    log("info", "memory disabled via configuration")
     return {}
   }
 
   const loaded = await getStore()
   log("info", `memory plugin loaded (${loaded.entries.length} entries, summary ${loaded.summary.length} chars)`)
 
-  const timer = setTimeout(() => void sweep(), CONFIG.sweepStartMs)
-  const interval = setInterval(() => void sweep(), CONFIG.sweepIntervalMs)
+  const timer = CONFIG.dream ? setTimeout(() => void sweep(), CONFIG.sweepStartMs) : undefined
+  const interval = CONFIG.dream ? setInterval(() => void sweep(), CONFIG.sweepIntervalMs) : undefined
 
   return {
     dispose: async () => {
-      clearTimeout(timer)
-      clearInterval(interval)
+      if (timer) clearTimeout(timer)
+      if (interval) clearInterval(interval)
       for (const t of debounces.values()) clearTimeout(t)
       debounces.clear()
     },
 
     event: async ({ event }: { event: any }) => {
       try {
+        if (!CONFIG.dream) return
         log("debug", "event received", { type: event?.type })
         if (event?.type === "session.idle" && event?.properties?.sessionID) {
           log("debug", "idle event -> schedule", { sessionID: event.properties.sessionID })
@@ -632,6 +641,7 @@ export default async ({ client }: { client: any }) => {
       output: { system: string[] },
     ) => {
       try {
+        if (!CONFIG.surface) return
         log("debug", "system transform called", { sessionID: input.sessionID, systemCount: output.system.length })
         if (!input.sessionID) return
         if (consolidationIDs.has(input.sessionID)) return
@@ -1036,3 +1046,7 @@ export default async ({ client }: { client: any }) => {
     },
   }
 }
+}
+
+export default async (input: { client: any }, options?: Record<string, unknown>) =>
+  createLegacyPlugin(resolveConfig(options))(input)

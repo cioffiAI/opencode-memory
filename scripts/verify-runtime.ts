@@ -1,6 +1,9 @@
 // Run against a real CLI with an isolated profile and a local mock model.
 // OPENCODE_TEST_BIN=/path/to/opencode OPENCODE_TEST_MAJOR=2 bun run verify:runtime
 // OPENCODE_TEST_PACKAGE may point to a clean installed tarball instead of this checkout.
+// OPENCODE_TEST_DISABLE_AUTO=1 also checks that DREAM and SURFACE stay off.
+// OPENCODE_TEST_CONFIG_OPTIONS=1 supplies those switches and dir through
+// opencode.jsonc, against conflicting environment values.
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -11,6 +14,8 @@ if (!binary) throw new Error("Set OPENCODE_TEST_BIN to an existing CLI binary; t
 const major = process.env.OPENCODE_TEST_MAJOR ?? "2"
 if (!["1", "2"].includes(major)) throw new Error("OPENCODE_TEST_MAJOR must be 1 or 2")
 const v2 = major === "2"
+const configOptions = process.env.OPENCODE_TEST_CONFIG_OPTIONS === "1"
+const disableAutomatic = process.env.OPENCODE_TEST_DISABLE_AUTO === "1" || configOptions
 const root = realpathSync(mkdtempSync(join(tmpdir(), `opencode-memory-v${major}-runtime-`)))
 const project = join(root, "project")
 const memory = join(root, "memory")
@@ -26,22 +31,29 @@ const cliEnv = {
   PATH: process.env.PATH!,
   XDG_DATA_HOME: join(root, "data"), XDG_CONFIG_HOME: join(root, "config"),
   XDG_CACHE_HOME: join(root, "cache"), XDG_STATE_HOME: join(root, "state"),
-  OPENCODE_CONFIG: join(configDir, "opencode.json"),
+  OPENCODE_CONFIG: join(configDir, configOptions ? "opencode.jsonc" : "opencode.json"),
   // Only the locally configured test model is needed. Avoid catalog/update
   // network requests while booting an otherwise empty CLI profile.
   OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_AUTOUPDATE: "1",
   OPENCODE_SERVER_USERNAME: "opencode", OPENCODE_SERVER_PASSWORD: password,
-  OPENCODE_MEMORY_DIR: memory, OPENCODE_MEMORY_DELAY_MS: "100",
+  OPENCODE_MEMORY_DIR: configOptions ? join(root, "wrong-memory") : memory,
+  OPENCODE_MEMORY_DELAY_MS: "100",
   OPENCODE_MEMORY_SWEEP_START_MS: "600000", OPENCODE_MEMORY_DEBUG: "1",
+  ...(configOptions
+    ? { OPENCODE_MEMORY_DREAM: "1", OPENCODE_MEMORY_SURFACE: "1" }
+    : disableAutomatic ? { OPENCODE_MEMORY_DREAM: "0", OPENCODE_MEMORY_SURFACE: "0" } : {}),
 }
+const configuredPackage = configOptions
+  ? { dir: memory, dream: false, surface: false }
+  : undefined
 const config = v2 ? {
-  plugins: [packageDir], model: "memory-test/test",
+  plugins: [configuredPackage ? { package: packageDir, options: configuredPackage } : packageDir], model: "memory-test/test",
   providers: { "memory-test": {
     package: "@ai-sdk/openai-compatible", settings: { baseURL: `http://127.0.0.1:${model.server.port}/v1`, apiKey: "test" },
     models: { test: { name: "Compatibility test", limit: { context: 32000, output: 2048 }, capabilities: { tools: true, input: ["text"], output: ["text"] } } },
   } },
 } : {
-  plugin: [packageDir], model: "memory-test/test", small_model: "memory-test/test",
+  plugin: [configuredPackage ? [packageDir, configuredPackage] : packageDir], model: "memory-test/test", small_model: "memory-test/test",
   provider: { "memory-test": {
     npm: "@ai-sdk/openai-compatible", name: "Compatibility test",
     options: { baseURL: `http://127.0.0.1:${model.server.port}/v1`, apiKey: "test" },
@@ -110,20 +122,30 @@ try {
       message.role === "tool" && JSON.stringify(message).includes(text === "WRITE_TEST" ? "Remembered" : "coffee in the morning"))), `${text} tool result`)
     if (v2) await until(async () => (await api(`${prefix}/context`)).at(-1)?.type === "idle", "session idle")
   }
-  await until(() => store().entries.some((entry: any) => entry.source === "dreamed" && entry.text.includes("teal terminal")), "automatic DREAM", 40_000)
+  if (disableAutomatic) {
+    await Bun.sleep(500)
+    if (store().entries.some((entry: any) => entry.source === "dreamed")) throw new Error("DREAM wrote while disabled")
+  } else {
+    await until(() => store().entries.some((entry: any) => entry.source === "dreamed" && entry.text.includes("teal terminal")), "automatic DREAM", 40_000)
+  }
   const saved = store()
   if (saved.version !== 2 || saved.entries.find((entry: any) => entry.id === "legacy")?.tier !== "core") throw new Error("store migration lost legacy data")
   const allRequests = JSON.stringify(model.requests)
-  if (!model.requests.some((request) => request.messages.some((message: any) =>
-    message.role === "system" && JSON.stringify(message).includes("<memory>") && JSON.stringify(message).includes("coffee in the morning")))) {
-    throw new Error("written memory missing from model context")
-  }
+  const injectedMemory = model.requests.some((request) => request.messages.some((message: any) =>
+    message.role === "system" && JSON.stringify(message).includes("<memory>")))
+  const injectedExplicit = model.requests.some((request) => request.messages.some((message: any) =>
+    message.role === "system" && JSON.stringify(message).includes("<memory>") && JSON.stringify(message).includes("coffee in the morning")))
+  if (disableAutomatic && injectedMemory) throw new Error("SURFACE injected while disabled")
+  if (!disableAutomatic && !injectedExplicit) throw new Error("written memory missing from model context")
   if (allRequests.includes("SECRET_LOCAL_ONLY_COMPAT")) throw new Error("local-only memory reached the model")
   const internal = model.requests.filter((request) => /You are (the memory consolidation module|a deduplication checker)/.test(JSON.stringify(request.messages)))
-  if (!internal.length || internal.some((request) => request.tools?.length)) throw new Error("DREAM/dedup exposed tools")
+  if (disableAutomatic && internal.length) throw new Error("DREAM called the model while disabled")
+  if (!disableAutomatic && (!internal.length || internal.some((request) => request.tools?.length))) throw new Error("DREAM/dedup exposed tools")
   const names = ["read", "write", "update", "why", "inspect", "useful", "irrelevant", "forget", "clear"].map((name) => `memory_${name}`)
   if (names.some((name) => !allRequests.includes(name))) throw new Error("not all nine memory tools reached the model")
-  console.log(`OK V${major}: real CLI load, nine tools, write/read, context, DREAM, migration, local-only privacy, tool-free internal calls`)
+  console.log(disableAutomatic
+    ? `OK V${major}: real CLI load, nine tools, write/read, DREAM and SURFACE disabled${configOptions ? " through opencode.jsonc" : ""}, migration, local-only privacy`
+    : `OK V${major}: real CLI load, nine tools, write/read, context, DREAM, migration, local-only privacy, tool-free internal calls`)
   writeFileSync(join(root, "result.json"), JSON.stringify({ version: version.stdout.toString().trim(), packageDir, checks: "passed", requests: model.requests.length, internalCalls: internal.length }, null, 2))
 } finally {
   child.kill("SIGTERM")

@@ -4,7 +4,7 @@
 
 import { mkdir, open, readFile, rename, unlink, writeFile } from "fs/promises"
 import path from "path"
-import { CONFIG, DATA_DIR, LOCK_FILE, STATE_FILE, STORE_FILE, SUMMARY_FILE } from "./config.ts"
+import { DATA_DIR } from "./config.ts"
 import { emptyStore, normalizeStore, type Store } from "./core.ts"
 
 function now() {
@@ -13,26 +13,6 @@ function now() {
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
-}
-
-export async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  await mkdir(DATA_DIR, { recursive: true }).catch(() => {})
-  let fd: Awaited<ReturnType<typeof open>> | undefined
-  for (let i = 0; i < 40; i++) {
-    try {
-      fd = await open(LOCK_FILE, "wx")
-      break
-    } catch {
-      await sleep(50)
-    }
-  }
-  if (!fd) throw new Error("memory store lock timeout")
-  try {
-    return await fn()
-  } finally {
-    await fd.close().catch(() => {})
-    await unlink(LOCK_FILE).catch(() => {})
-  }
 }
 
 async function readJson<T>(file: string, fallback: T): Promise<T> {
@@ -55,24 +35,7 @@ async function writeJson(file: string, value: unknown) {
 // prompt and the dedup guard see outdated entries (or none at all).
 // No lock needed on read: writeJson uses an atomic rename, so we always see
 // a complete file (old or new version). This also avoids nested locks inside
-// the critical sections that call readStore() themselves.
-async function readStore(): Promise<Store> {
-  return normalizeStore(await readJson<Store>(STORE_FILE, emptyStore()))
-}
-
-export async function getStore(): Promise<Store> {
-  return readStore()
-}
-
-export async function writeStore(store: Store) {
-  await writeJson(STORE_FILE, store)
-  await writeFile(
-    SUMMARY_FILE,
-    `# opencode memory summary\n\nUpdated: ${new Date(store.updatedAt).toISOString()}\n\n${store.summary || "_No summary yet — it is generated after the first consolidation._"}\n`,
-    "utf8",
-  )
-}
-
+// the critical sections that call getStore() themselves.
 export type InProgress = {
   targetTs: number
   startedAt: number
@@ -84,13 +47,59 @@ export type State = {
   inProgress?: Record<string, InProgress>
 }
 
-export async function getState(): Promise<State> {
-  const state = await withLock(() => readJson<State>(STATE_FILE, { sessions: {}, inProgress: {} }))
-  state.sessions = state.sessions ?? {}
-  state.inProgress = state.inProgress ?? {}
-  return state
+export function createStore(dataDir: string) {
+  const lockFile = path.join(dataDir, ".lock")
+  const storeFile = path.join(dataDir, "store.json")
+  const stateFile = path.join(dataDir, "state.json")
+  const summaryFile = path.join(dataDir, "SUMMARY.md")
+
+  async function withLock<T>(fn: () => Promise<T>): Promise<T> {
+    await mkdir(dataDir, { recursive: true }).catch(() => {})
+    let fd: Awaited<ReturnType<typeof open>> | undefined
+    for (let i = 0; i < 40; i++) {
+      try {
+        fd = await open(lockFile, "wx")
+        break
+      } catch {
+        await sleep(50)
+      }
+    }
+    if (!fd) throw new Error("memory store lock timeout")
+    try {
+      return await fn()
+    } finally {
+      await fd.close().catch(() => {})
+      await unlink(lockFile).catch(() => {})
+    }
+  }
+
+  async function getStore(): Promise<Store> {
+    return normalizeStore(await readJson<Store>(storeFile, emptyStore()))
+  }
+
+  async function writeStore(store: Store) {
+    await writeJson(storeFile, store)
+    await writeFile(
+      summaryFile,
+      `# opencode memory summary\n\nUpdated: ${new Date(store.updatedAt).toISOString()}\n\n${store.summary || "_No summary yet — it is generated after the first consolidation._"}\n`,
+      "utf8",
+    )
+  }
+
+  async function getState(): Promise<State> {
+    const state = await withLock(() => readJson<State>(stateFile, { sessions: {}, inProgress: {} }))
+    state.sessions = state.sessions ?? {}
+    state.inProgress = state.inProgress ?? {}
+    return state
+  }
+
+  async function saveState(state: State) {
+    await withLock(() => writeJson(stateFile, state))
+  }
+
+  return { withLock, getStore, writeStore, getState, saveState }
 }
 
-export async function saveState(state: State) {
-  await withLock(() => writeJson(STATE_FILE, state))
-}
+export type StoreIO = ReturnType<typeof createStore>
+const defaultStore = createStore(DATA_DIR)
+export const { withLock, getStore, writeStore, getState, saveState } = defaultStore
