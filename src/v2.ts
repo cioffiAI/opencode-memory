@@ -24,8 +24,8 @@ import {
   type Entry,
   type RankedMemory,
 } from "./core.ts"
-import { CONFIG } from "./config.ts"
-import { getState, getStore, saveState, withLock, writeStore } from "./store.ts"
+import { resolveConfig, type MemoryConfig } from "./config.ts"
+import { createStore, type StoreIO } from "./store.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
 type SessionInfo = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
@@ -96,10 +96,16 @@ class V2MemoryRuntime {
   private sweepRepeatTimer?: ReturnType<typeof setInterval>
   private readonly registrations: Array<{ dispose: () => Promise<void> }> = []
 
-  constructor(private readonly ctx: Plugin.Context) {}
+  private readonly config: MemoryConfig
+  private readonly store: StoreIO
+
+  constructor(private readonly ctx: Plugin.Context) {
+    this.config = resolveConfig(ctx.options)
+    this.store = createStore(this.config.dir)
+  }
 
   private log(level: LogLevel, message: string, extra?: Record<string, unknown>) {
-    if (level === "debug" && !CONFIG.debug) return
+    if (level === "debug" && !this.config.debug) return
     const details = extra ? ` ${JSON.stringify(extra)}` : ""
     const line = `[opencode-memory] ${message}${details}`
     if (level === "error") console.error(line)
@@ -109,12 +115,12 @@ class V2MemoryRuntime {
   }
 
   async setup(): Promise<() => Promise<void>> {
-    if (CONFIG.off) {
-      this.log("info", "memory disabled via OPENCODE_MEMORY_OFF=1")
+    if (this.config.off) {
+      this.log("info", "memory disabled via configuration")
       return async () => {}
     }
 
-    const loaded = await getStore()
+    const loaded = await this.store.getStore()
     this.log("info", `memory V2 plugin loaded (${loaded.entries.length} entries, summary ${loaded.summary.length} chars)`)
 
     try {
@@ -123,18 +129,22 @@ class V2MemoryRuntime {
       const missing = MEMORY_TOOL_NAMES.filter((name) => !registered.has(name))
       if (missing.length > 0) throw new Error(`memory V2 tool registration incomplete: ${missing.join(", ")}`)
       this.log("info", `memory V2 tools registered (${MEMORY_TOOL_NAMES.length})`)
-      this.registrations.push(await this.ctx.session.hook("context", async (event) => {
-        try {
-          const block = await this.buildMemoryBlock(String(event.sessionID))
-          if (block) event.system.push({ type: "text", text: block })
-        } catch (error) {
-          this.log("debug", "context hook failed", { error: String(error) })
-        }
-      }))
+      if (this.config.surface) {
+        this.registrations.push(await this.ctx.session.hook("context", async (event) => {
+          try {
+            const block = await this.buildMemoryBlock(String(event.sessionID))
+            if (block) event.system.push({ type: "text", text: block })
+          } catch (error) {
+            this.log("debug", "context hook failed", { error: String(error) })
+          }
+        }))
+      }
 
-      this.eventTask = this.consumeEvents()
-      this.sweepStartTimer = setTimeout(() => void this.sweep(), CONFIG.sweepStartMs)
-      this.sweepRepeatTimer = setInterval(() => void this.sweep(), CONFIG.sweepIntervalMs)
+      if (this.config.dream) {
+        this.eventTask = this.consumeEvents()
+        this.sweepStartTimer = setTimeout(() => void this.sweep(), this.config.sweepStartMs)
+        this.sweepRepeatTimer = setInterval(() => void this.sweep(), this.config.sweepIntervalMs)
+      }
 
       return () => this.dispose()
     } catch (error) {
@@ -186,7 +196,7 @@ class V2MemoryRuntime {
       this.debounces.delete(sessionID)
       if (!this.queue.includes(sessionID)) this.queue.push(sessionID)
       void this.startPump()
-    }, CONFIG.delayMs)
+    }, this.config.delayMs)
     this.debounces.set(sessionID, timer)
   }
 
@@ -212,12 +222,12 @@ class V2MemoryRuntime {
   private async sweep() {
     if (this.controller.signal.aborted) return
     try {
-      const state = await getState()
+      const state = await this.store.getState()
       const candidates = Object.entries(state.inProgress ?? {})
-        .filter(([, marker]) => now() - marker.startedAt >= CONFIG.inProgressTimeoutMs)
+        .filter(([, marker]) => now() - marker.startedAt >= this.config.inProgressTimeoutMs)
         .filter(([sessionID, marker]) => (state.sessions[sessionID] ?? 0) < marker.targetTs)
         .sort(([, left], [, right]) => right.targetTs - left.targetTs)
-        .slice(0, CONFIG.sweepBatch)
+        .slice(0, this.config.sweepBatch)
       for (const [sessionID] of candidates) this.enqueue(sessionID)
       if (candidates.length > 0) this.log("debug", "recovery sweep queued", { count: candidates.length })
     } catch (error) {
@@ -318,19 +328,19 @@ REPLY WITH STRICT JSON ONLY:
     if (!session) return
     const messages = await this.ctx.session.context({ sessionID })
     const lastTs = messages.reduce((max, message) => Math.max(max, messageTimestamp(message)), 0)
-    const state = await getState()
+    const state = await this.store.getState()
     if (lastTs <= (state.sessions[sessionID] ?? 0)) return
 
     const inProgress = state.inProgress?.[sessionID]
-    if (inProgress && now() - inProgress.startedAt < CONFIG.inProgressTimeoutMs) return
+    if (inProgress && now() - inProgress.startedAt < this.config.inProgressTimeoutMs) return
 
     const transcript = messages
       .map((message) => `${message.type}: ${messageText(message)}`)
       .join("\n\n")
-      .slice(-CONFIG.transcriptChars)
+      .slice(-this.config.transcriptChars)
     const messageIDs = messages.map((message) => String(message.id)).slice(-20)
     const directory = session.location.directory
-    const store = await getStore()
+    const store = await this.store.getStore()
     const visible = consolidationEntries(store, directory)
     const entriesBlock =
       visible.length === 0
@@ -375,7 +385,7 @@ TRANSCRIPT (session title: ${session.title ?? ""}):
 ${transcript}`
 
     state.inProgress![sessionID] = { targetTs: lastTs, startedAt: now() }
-    await saveState(state)
+    await this.store.saveState(state)
     let completed = false
     try {
       const answer = await this.generate(prompt, session)
@@ -388,14 +398,14 @@ ${transcript}`
         parsed.new = parsed.new.filter((_: unknown, index: number) => !skip.has(index))
       }
 
-      await withLock(async () => {
-        const fresh = await getStore()
+      await this.store.withLock(async () => {
+        const fresh = await this.store.getStore()
         applyConsolidation(fresh, parsed, directory, now(), this.log.bind(this), {
           sessionID,
           messageIDs,
         })
-        prune(fresh, now(), CONFIG.maxEntries)
-        await writeStore(fresh)
+        prune(fresh, now(), this.config.maxEntries)
+        await this.store.writeStore(fresh)
       })
       state.sessions[sessionID] = lastTs
       completed = true
@@ -403,7 +413,7 @@ ${transcript}`
     } finally {
       if (completed) delete state.inProgress![sessionID]
       else state.inProgress![sessionID] = { targetTs: lastTs, startedAt: now() }
-      await saveState(state).catch(() => {})
+      await this.store.saveState(state).catch(() => {})
     }
   }
 
@@ -426,7 +436,7 @@ ${transcript}`
     if (candidates.length <= 1) return candidates
     const key = query.trim().toLowerCase() || " "
     const cached = this.rerankCache.get(key)
-    if (cached && now() - cached.at < CONFIG.rerankCacheMs) {
+    if (cached && now() - cached.at < this.config.rerankCacheMs) {
       if (cached.abstain) return []
       const positions = new Map(cached.order.map((id, index) => [id, index]))
       return [...candidates].sort((a, b) => {
@@ -453,7 +463,7 @@ QUESTION: ${query || "(empty)"}
 CANDIDATES:
 ${lines}`
     try {
-      const answer = await this.generate(prompt, session, CONFIG.rerankTimeoutMs)
+      const answer = await this.generate(prompt, session, this.config.rerankTimeoutMs)
       if (!answer) return candidates
       const outcome = parseRerankAnswer(answer, visible.length)
       if (outcome.kind === "abstain") {
@@ -475,15 +485,15 @@ ${lines}`
   private async markSurfaced(ids: string[], time = now()) {
     if (ids.length === 0) return
     try {
-      await withLock(async () => {
-        const store = await getStore()
+      await this.store.withLock(async () => {
+        const store = await this.store.getStore()
         const due = ids.some((id) => {
           const entry = store.entries.find((candidate) => candidate.id === id)
-          return !!entry && time - (entry.lastUsed ?? 0) >= CONFIG.surfaceRefreshMs
+          return !!entry && time - (entry.lastUsed ?? 0) >= this.config.surfaceRefreshMs
         })
         if (!due) return
-        applySurfaceFeedback(store, ids, time, CONFIG.surfaceRefreshMs)
-        await writeStore(store)
+        applySurfaceFeedback(store, ids, time, this.config.surfaceRefreshMs)
+        await this.store.writeStore(store)
       })
     } catch (error) {
       this.log("debug", "markSurfaced failed", { error: String(error) })
@@ -491,7 +501,7 @@ ${lines}`
   }
 
   private async buildMemoryBlock(sessionID: string): Promise<string | undefined> {
-    const store = await getStore()
+    const store = await this.store.getStore()
     if (store.entries.length === 0 && !store.summary) return undefined
     const session = await this.sessionInfo(sessionID)
     if (!session) return undefined
@@ -500,13 +510,13 @@ ${lines}`
     const query = await this.sessionTopicQuery(sessionID)
     const ranked = retrieve(store, directory, query, time, {
       excludeSensitivity: new Set(["local-only"]),
-      candidateCount: CONFIG.rerankCandidates,
+      candidateCount: this.config.rerankCandidates,
     })
-    const reranked = CONFIG.rerank ? await this.rerank(session, sessionID, query, ranked) : ranked
-    const qualified = CONFIG.rerank ? reranked : reranked.filter(passesRelevanceGate)
-    const top = qualified.slice(0, CONFIG.maxFacts)
+    const reranked = this.config.rerank ? await this.rerank(session, sessionID, query, ranked) : ranked
+    const qualified = this.config.rerank ? reranked : reranked.filter(passesRelevanceGate)
+    const top = qualified.slice(0, this.config.maxFacts)
     const selected = new Set(top.map((candidate) => candidate.entry.id))
-    const core = coreSlot(store, directory, selected, time, CONFIG.coreSlot)
+    const core = coreSlot(store, directory, selected, time, this.config.coreSlot)
     const surfaced: RankedMemory[] = [
       ...top,
       ...core.map((entry, index) => ({
@@ -538,7 +548,7 @@ ${lines}`
     }
     lines.push("</memory>")
     let block = lines.join("\n")
-    if (block.length > CONFIG.maxChars) block = `${block.slice(0, CONFIG.maxChars - 1)}…`
+    if (block.length > this.config.maxChars) block = `${block.slice(0, this.config.maxChars - 1)}…`
     return block
   }
 
@@ -570,7 +580,7 @@ ${lines}`
           scope: { type: "string", enum: ["global", "project"], description: "Filter by scope" },
         }),
         execute: async (args, context) => {
-          const store = await getStore()
+          const store = await this.store.getStore()
           const directory = await this.directoryFor(context.sessionID)
           const hits = readQuery(store, directory, {
             query: args.query ? String(args.query) : undefined,
@@ -605,8 +615,8 @@ ${lines}`
           const sensitivity: Entry["sensitivity"] = args.sensitivity === "private" || args.sensitivity === "local-only" ? args.sensitivity : undefined
           const expiresAt = tier === "temporary" ? now() + Number(args.ttlHours ?? 24) * 60 * 60 * 1000 : undefined
           let status = ""
-          await withLock(async () => {
-            const fresh = await getStore()
+          await this.store.withLock(async () => {
+            const fresh = await this.store.getStore()
             const existing = findWritableTarget(fresh.entries, text, scope, directory, 0.6, sensitivity === "local-only")
             if (existing) {
               existing.text = text
@@ -647,8 +657,8 @@ ${lines}`
               })
             }
             fresh.updatedAt = now()
-            prune(fresh, now(), CONFIG.maxEntries)
-            await writeStore(fresh)
+            prune(fresh, now(), this.config.maxEntries)
+            await this.store.writeStore(fresh)
           })
           return `Remembered (${scope})${status}: ${text}`
         },
@@ -667,8 +677,8 @@ ${lines}`
           const directory = await this.directoryFor(context.sessionID)
           let updated = 0
           let resolvedConflict = false
-          await withLock(async () => {
-            const fresh = await getStore()
+          await this.store.withLock(async () => {
+            const fresh = await this.store.getStore()
             const visible = readableEntries(fresh, directory)
             const target = args.id
               ? visible.find((entry) => entry.id === args.id)
@@ -688,7 +698,7 @@ ${lines}`
               updated = 1
             }
             fresh.updatedAt = now()
-            await writeStore(fresh)
+            await this.store.writeStore(fresh)
           })
           return updated ? `Updated: ${fact}${resolvedConflict ? " (conflict resolved)" : ""}` : "No matching entry found."
         },
@@ -698,7 +708,7 @@ ${lines}`
         description: "Explain a memory's provenance, lifecycle status and current score breakdown.",
         input: objectSchema({ id: { type: "string", description: "Entry id from memory_read" } }, ["id"]),
         execute: async (args, context) => {
-          const store = await getStore()
+          const store = await this.store.getStore()
           const directory = await this.directoryFor(context.sessionID)
           const entry = readableEntries(store, directory).find((candidate) => candidate.id === args.id)
           if (!entry) return "No memory entry with this id."
@@ -749,7 +759,7 @@ ${lines}`
           limit: { type: "number", description: "Maximum entries in list views (default 10)" },
         }),
         execute: async (args, context) => {
-          const store = await getStore()
+          const store = await this.store.getStore()
           const directory = await this.directoryFor(context.sessionID)
           const visible = readableEntries(store, directory)
           const show = args.show ?? "stats"
@@ -812,13 +822,13 @@ ${lines}`
         execute: async (args, context) => {
           const directory = await this.directoryFor(context.sessionID)
           let ok = false
-          await withLock(async () => {
-            const fresh = await getStore()
+          await this.store.withLock(async () => {
+            const fresh = await this.store.getStore()
             if (!readableEntries(fresh, directory).some((entry) => entry.id === args.id)) return
             ok = applyUsefulFeedback(fresh, String(args.id), now())
             if (ok) {
               fresh.updatedAt = now()
-              await writeStore(fresh)
+              await this.store.writeStore(fresh)
             }
           })
           return ok ? "Noted as useful." : "No memory entry with this id."
@@ -831,13 +841,13 @@ ${lines}`
         execute: async (args, context) => {
           const directory = await this.directoryFor(context.sessionID)
           let ok = false
-          await withLock(async () => {
-            const fresh = await getStore()
+          await this.store.withLock(async () => {
+            const fresh = await this.store.getStore()
             if (!readableEntries(fresh, directory).some((entry) => entry.id === args.id)) return
             ok = applyIrrelevantFeedback(fresh, String(args.id), now())
             if (ok) {
               fresh.updatedAt = now()
-              await writeStore(fresh)
+              await this.store.writeStore(fresh)
             }
           })
           return ok ? "Noted as irrelevant." : "No memory entry with this id."
@@ -853,8 +863,8 @@ ${lines}`
         execute: async (args, context) => {
           const directory = await this.directoryFor(context.sessionID)
           let removed = 0
-          await withLock(async () => {
-            const fresh = await getStore()
+          await this.store.withLock(async () => {
+            const fresh = await this.store.getStore()
             const forgettable = new Set(readableEntries(fresh, directory).map((entry) => entry.id))
             const before = fresh.entries.length
             fresh.entries = fresh.entries.filter((entry) => {
@@ -869,7 +879,7 @@ ${lines}`
             removed = before - fresh.entries.length
             if (removed) fresh.summary = ""
             fresh.updatedAt = now()
-            await writeStore(fresh)
+            await this.store.writeStore(fresh)
           })
           return removed ? `Forgot ${removed} entr${removed === 1 ? "y" : "ies"}.` : "No matching entry found."
         },
@@ -881,8 +891,8 @@ ${lines}`
         execute: async (args, context) => {
           const directory = await this.directoryFor(context.sessionID)
           let removed = 0
-          await withLock(async () => {
-            const fresh = await getStore()
+          await this.store.withLock(async () => {
+            const fresh = await this.store.getStore()
             const before = fresh.entries.length
             if (args.scope === "project") {
               removed = clearProjectEntries(fresh, directory)
@@ -895,7 +905,7 @@ ${lines}`
             }
             if (removed) fresh.summary = ""
             fresh.updatedAt = now()
-            await writeStore(fresh)
+            await this.store.writeStore(fresh)
           })
           return removed ? `Cleared ${removed} memory entr${removed === 1 ? "y" : "ies"}.` : "Memory already empty."
         },

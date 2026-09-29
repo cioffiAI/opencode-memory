@@ -115,6 +115,23 @@ for (const [name, t] of Object.entries(instance.tool)) {
 await instance.dispose()
 console.log("OK V1: " + actual.length + " tools registered, dispose() completed")
 
+const configuredDir = memoryDir + "/v1-configured"
+const configuredV1 = await plugin.server({ client }, { dir: configuredDir, dream: false, surface: false })
+await configuredV1.tool.memory_write.execute({ fact: "Configured V1 store." }, { directory: process.cwd() })
+const configuredEntries = JSON.parse(readFileSync(configuredDir + "/store.json", "utf8")).entries
+if (configuredEntries.length !== 1 || configuredEntries[0].text !== "Configured V1 store.") {
+  console.error("FAIL: installed V1 adapter ignored plugin options")
+  process.exit(1)
+}
+const configuredOutput = { system: [] }
+await configuredV1["experimental.chat.system.transform"]({ sessionID: "configured" }, configuredOutput)
+if (configuredOutput.system.length) {
+  console.error("FAIL: installed V1 adapter surfaced memory despite options")
+  process.exit(1)
+}
+await configuredV1.dispose()
+console.log("OK V1: options select an isolated store and disable SURFACE")
+
 const v2Tools = []
 const hooks = {}
 const subscribe = async function* ({ signal } = {}) {

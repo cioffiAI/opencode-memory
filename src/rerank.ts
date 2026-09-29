@@ -19,6 +19,7 @@ export const RERANK_TITLE = "memory-surfacing"
 export type RerankOptions = {
   timeoutMs: number
   cacheMs: number
+  cache?: Map<string, CacheEntry>
   log?: (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
   /** called synchronously once the child session exists (registration hooks) */
   onChildCreated?: (childSessionID: string) => void
@@ -84,7 +85,8 @@ export async function rerankCandidates(
 ): Promise<RankedMemory[]> {
   if (candidates.length <= 1) return candidates
   const key = norm(query || " ")
-  const cached = rerankCache.get(key)
+  const cache = opts.cache ?? rerankCache
+  const cached = cache.get(key)
   if (cached && Date.now() - cached.at < opts.cacheMs) {
     if (cached.abstain) return []
     return applyRerankOrder(candidates, cached.order)
@@ -126,7 +128,7 @@ ${lines}`
     }
     const outcome = parseRerankAnswer(answer, visible.length)
     if (outcome.kind === "abstain") {
-      rerankCache.set(key, { at: Date.now(), order: [], abstain: true })
+      cache.set(key, { at: Date.now(), order: [], abstain: true })
       return []
     }
     if (outcome.kind === "invalid") {
@@ -134,7 +136,7 @@ ${lines}`
       return candidates
     }
     const ids = outcome.order.map((i) => visible[i].entry.id)
-    rerankCache.set(key, { at: Date.now(), order: ids })
+    cache.set(key, { at: Date.now(), order: ids })
     const byId = new Map(candidates.map((c) => [c.entry.id, c]))
     const orderedVisible = ids.map((id) => byId.get(id)!).filter(Boolean)
     // local-only candidates (excluded from judging) keep their lexical tail

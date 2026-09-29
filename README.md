@@ -146,20 +146,71 @@ frequently-surfaced memory immortal under pruning. Negative feedback
 
 ## Configuration
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `OPENCODE_MEMORY_OFF` | off | `1` disables the plugin. |
-| `OPENCODE_MEMORY_DIR` | `~/.local/share/opencode/memory` | Data directory (store/state/summary). |
-| `OPENCODE_MEMORY_DEBUG` | off | `1` enables trace logging. |
-| `OPENCODE_MEMORY_DELAY_MS` | 90000 | Debounce of consolidation after session idle (3s in tests). |
-| `OPENCODE_MEMORY_RERANK` | off | `1` enables the semantic reranking stage (headless LLM rerank of the candidate window; cached per query; may ABSTAIN; falls back to lexical order on timeout). |
-| `OPENCODE_MEMORY_RERANK_CANDIDATES` | 30 | Candidate window handed to the reranker. |
-| `OPENCODE_MEMORY_RERANK_TIMEOUT_MS` | 4000 | Rerank timeout before lexical fallback. |
-| `OPENCODE_MEMORY_RERANK_CACHE_MS` | 60000 | Per-query rerank cache lifetime. |
-| `OPENCODE_MEMORY_CORE_SLOT` | 3 | Core-tier entries always injected beyond relevance matches. |
-| `OPENCODE_MEMORY_SURFACE_REFRESH_MS` | 900000 | Min interval between two exposure-counter updates for the same entry. |
-| `OPENCODE_MEMORY_GC_CHILD_AGE_MS` | 600000 | V1 only: min age of an orphan helper session before auto-removal. V2 creates no helper sessions. |
-| `OPENCODE_MEMORY_INPROGRESS_TIMEOUT_MS` | 600000 | Expiry of the `inProgress` marker (crash recovery). |
+In OpenCode V2, configure the plugin in `opencode.jsonc` with an object entry:
+
+```jsonc
+{
+  "plugins": [{
+    "package": "@cioffi_ai/opencode-memory",
+    "options": {
+      "dream": false,
+      "surface": false
+    }
+  }]
+}
+```
+
+OpenCode V1 1.18.29+ uses a package/options pair instead:
+
+```jsonc
+{
+  "plugin": [["@cioffi_ai/opencode-memory", {
+    "dream": false,
+    "surface": false
+  }]]
+}
+```
+
+Every setting below accepts a typed plugin option. An option takes precedence
+over its environment variable; otherwise the environment variable or default
+applies. Environment booleans use `1`/`0`, while JSONC options use `true`/`false`.
+Numeric options must be integers. Unknown or invalid options fail plugin setup
+with the offending name instead of silently falling back.
+
+| Option | Environment variable | Default | Effect |
+| --- | --- | --- | --- |
+| `off` | `OPENCODE_MEMORY_OFF` | false | Disable the entire plugin. |
+| `dream` | `OPENCODE_MEMORY_DREAM` | true | Automatic conversation consolidation and recovery sweep. |
+| `surface` | `OPENCODE_MEMORY_SURFACE` | true | Automatic memory injection and semantic reranking. |
+| `dir` | `OPENCODE_MEMORY_DIR` | `~/.local/share/opencode/memory` | Store, state and summary directory. |
+| `debug` | `OPENCODE_MEMORY_DEBUG` | false | Trace logging. |
+| `delayMs` | `OPENCODE_MEMORY_DELAY_MS` | 90000 | Idle debounce before DREAM. |
+| `maxEntries` | `OPENCODE_MEMORY_MAX_ENTRIES` | 400 | Maximum retained memories. |
+| `maxFacts` | `OPENCODE_MEMORY_MAX_FACTS` | 18 | Maximum relevance-ranked facts in a prompt. |
+| `maxChars` | `OPENCODE_MEMORY_MAX_CHARS` | 2400 | Maximum memory-block characters. |
+| `transcriptChars` | `OPENCODE_MEMORY_TRANSCRIPT_CHARS` | 12000 | Maximum transcript characters sent to DREAM. |
+| `sweepIntervalMs` | `OPENCODE_MEMORY_SWEEP_MS` | 600000 | Recovery sweep interval. |
+| `sweepStartMs` | `OPENCODE_MEMORY_SWEEP_START_MS` | 20000 | Delay before first recovery sweep. |
+| `sweepBatch` | `OPENCODE_MEMORY_SWEEP_BATCH` | 8 | Maximum sessions processed per sweep. |
+| `gcChildAgeMs` | `OPENCODE_MEMORY_GC_CHILD_AGE_MS` | 600000 | V1 orphan helper-session age; V2 creates no helper sessions. |
+| `inProgressTimeoutMs` | `OPENCODE_MEMORY_INPROGRESS_TIMEOUT_MS` | 600000 | Expiry of a DREAM in-progress marker. |
+| `rerank` | `OPENCODE_MEMORY_RERANK` | false | Optional model-based relevance reranking. |
+| `rerankCandidates` | `OPENCODE_MEMORY_RERANK_CANDIDATES` | 30 | Candidate window for reranking. |
+| `rerankTimeoutMs` | `OPENCODE_MEMORY_RERANK_TIMEOUT_MS` | 4000 | Rerank timeout before lexical fallback. |
+| `rerankCacheMs` | `OPENCODE_MEMORY_RERANK_CACHE_MS` | 60000 | Rerank cache lifetime. |
+| `coreSlot` | `OPENCODE_MEMORY_CORE_SLOT` | 3 | Core-tier entries injected beyond relevance matches. |
+| `surfaceRefreshMs` | `OPENCODE_MEMORY_SURFACE_REFRESH_MS` | 900000 | Minimum interval between persisted exposure updates. |
+
+Use an absolute `dir` path when overriding the store location. Each plugin
+instance uses its own resolved options and store path. Changing `dir` selects a
+different store; it does not move data from the old directory.
+
+Set `OPENCODE_MEMORY_DREAM=0` to stop automatic consolidation and its model calls. Set
+`OPENCODE_MEMORY_SURFACE=0` to stop automatic prompt injection; this also prevents
+semantic reranking even if `OPENCODE_MEMORY_RERANK=1`. Either setting leaves the
+explicit memory tools available. `OPENCODE_MEMORY_OFF=1` disables the entire plugin.
+These switches do not prevent OpenCode itself or explicit tool calls from sending
+conversation content to the configured model provider.
 
 ## Retrieval semantics (v1.6)
 

@@ -11,6 +11,8 @@ let generateCalls = 0
 let foreignReads = 0
 const disposed = []
 const failSetup = process.env.V2_CHECK_FAIL_SETUP === "1"
+const dreamDisabled = process.env.V2_CHECK_DREAM_DISABLED === "1"
+const surfaceDisabled = process.env.V2_CHECK_SURFACE_DISABLED === "1"
 const eventType = process.env.V2_CHECK_EVENT ?? "session.execution.succeeded"
 
 const contextMessages = [
@@ -116,20 +118,32 @@ if (failSetup) {
 
 const cleanup = await plugin.setup(ctx)
 if (tools.length !== 9) throw new Error(`expected 9 V2 tools, got ${tools.length}`)
+if (surfaceDisabled === Boolean(hooks.context)) throw new Error("SURFACE hook registration does not match configuration")
 
 const storePath = `${process.env.OPENCODE_MEMORY_DIR}/store.json`
 let store
-for (let attempt = 0; attempt < 100; attempt++) {
+if (dreamDisabled) {
+  await Bun.sleep(30)
+  if (generateCalls !== 0) throw new Error("DREAM generated text while disabled")
   try {
     store = JSON.parse(await readFile(storePath, "utf8"))
-    if (store.entries.some((entry) => entry.source === "dreamed")) break
-  } catch {}
-  await Bun.sleep(10)
+    if (store.entries.some((entry) => entry.source === "dreamed")) throw new Error("DREAM wrote a fact while disabled")
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error
+  }
+} else {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      store = JSON.parse(await readFile(storePath, "utf8"))
+      if (store.entries.some((entry) => entry.source === "dreamed")) break
+    } catch {}
+    await Bun.sleep(10)
+  }
+  if (!store?.entries.some((entry) => entry.source === "dreamed" && entry.sourceSessionID === sessionID)) {
+    throw new Error(`${sweepOnly ? "recovery sweep" : "session.idle"} did not run V2 DREAM consolidation`)
+  }
+  if (generateCalls !== 1) throw new Error(`expected one tool-free generate call, got ${generateCalls}`)
 }
-if (!store?.entries.some((entry) => entry.source === "dreamed" && entry.sourceSessionID === sessionID)) {
-  throw new Error(`${sweepOnly ? "recovery sweep" : "session.idle"} did not run V2 DREAM consolidation`)
-}
-if (generateCalls !== 1) throw new Error(`expected one tool-free generate call, got ${generateCalls}`)
 
 const toolContext = {
   sessionID,
@@ -156,13 +170,18 @@ const event = {
   agent: "build",
   model: { providerID: "test", id: "test" },
 }
-await hooks.context(event)
-const block = event.system.map((part) => part.text).join("\n")
-if (!block.includes("<memory>")) throw new Error("V2 context hook did not inject memory")
-if (block.includes("SECRET_LOCAL_ONLY_VALUE")) throw new Error("local-only entry leaked through context hook")
+if (hooks.context) {
+  await hooks.context(event)
+  const block = event.system.map((part) => part.text).join("\n")
+  if (!block.includes("<memory>")) throw new Error("V2 context hook did not inject memory")
+  if (block.includes("SECRET_LOCAL_ONLY_VALUE")) throw new Error("local-only entry leaked through context hook")
+} else if (event.system.length !== 0) {
+  throw new Error("SURFACE injected memory while disabled")
+}
 
 await cleanup?.()
 await cleanup?.()
-if (JSON.stringify(disposed) !== '["context","tools"]') throw new Error("cleanup must dispose registrations exactly once in reverse order")
+const expectedDisposed = surfaceDisabled ? '["tools"]' : '["context","tools"]'
+if (JSON.stringify(disposed) !== expectedDisposed) throw new Error("cleanup must dispose registrations exactly once in reverse order")
 if (foreignReads !== 0) throw new Error("a completion event from another project reached consolidation")
 console.log("V2_CHECK_OK")

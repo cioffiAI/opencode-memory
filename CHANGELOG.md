@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [1.7.1] — 2026-09-29
+
+### Added
+
+- Independent DREAM and SURFACE switches, with explicit memory tools still
+  available when either automatic process is disabled (issue #8).
+- Typed plugin options in `opencode.jsonc` for every memory setting, with
+  per-instance configuration and store paths in both V1 and V2 (issue #9).
+
 ## [1.7.0] — 2026-09-28
 
 OpenCode V2 compatibility (issue #6), retaining OpenCode V1 1.18.29+ support.
