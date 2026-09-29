@@ -4,7 +4,7 @@
 
 import { mkdir, open, readFile, rename, unlink, writeFile } from "fs/promises"
 import path from "path"
-import { DATA_DIR } from "./config.ts"
+import { resolveConfig } from "./config.ts"
 import { emptyStore, normalizeStore, type Store } from "./core.ts"
 
 function now() {
@@ -101,5 +101,29 @@ export function createStore(dataDir: string) {
 }
 
 export type StoreIO = ReturnType<typeof createStore>
-const defaultStore = createStore(DATA_DIR)
-export const { withLock, getStore, writeStore, getState, saveState } = defaultStore
+// Direct callers retain the default helpers. Resolve their environment only
+// when first used, so plugin options can override it during adapter setup.
+let defaultStore: StoreIO | undefined
+function defaultIO(): StoreIO {
+  return defaultStore ??= createStore(resolveConfig().dir)
+}
+
+export function withLock<T>(fn: () => Promise<T>): Promise<T> {
+  return defaultIO().withLock(fn)
+}
+
+export function getStore(): Promise<Store> {
+  return defaultIO().getStore()
+}
+
+export function writeStore(store: Store): Promise<void> {
+  return defaultIO().writeStore(store)
+}
+
+export function getState(): Promise<State> {
+  return defaultIO().getState()
+}
+
+export function saveState(state: State): Promise<void> {
+  return defaultIO().saveState(state)
+}

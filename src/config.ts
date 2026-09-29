@@ -75,6 +75,9 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     if (value === undefined) return fallback
     if (typeof value === "boolean") return value
     if (typeof value === "string" && !Object.hasOwn(options, key)) {
+      // Existing environment switches treated every value except "1" as off.
+      // Keep that behavior for installations upgrading from 1.7.0.
+      if (key === "off" || key === "debug" || key === "rerank") return value === "1"
       if (value === "1") return true
       if (value === "0") return false
     }
@@ -123,15 +126,6 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     surfaceRefreshMs: integer("surfaceRefreshMs", 15 * 60 * 1000, 0),
   }
 }
-
-// Default exports remain for callers that use the store helpers directly.
-// Plugin adapters resolve their own options and store at setup time.
-export const CONFIG = resolveConfig()
-export const DATA_DIR = CONFIG.dir
-export const STORE_FILE = path.join(DATA_DIR, "store.json")
-export const STATE_FILE = path.join(DATA_DIR, "state.json")
-export const SUMMARY_FILE = path.join(DATA_DIR, "SUMMARY.md")
-export const LOCK_FILE = path.join(DATA_DIR, ".lock")
 
 // Tool configuration passed in the promptAsync body of EVERY headless helper
 // session (DREAM consolidation, semantic dedup check, semantic rerank).

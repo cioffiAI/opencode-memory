@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { join } from "node:path"
 import { resolveConfig } from "../src/config.ts"
 
 test("plugin options override environment values and preserve defaults", () => {
@@ -45,4 +46,22 @@ test("invalid options fail at setup with the offending name", () => {
   expect(() => resolveConfig({ rerankTimeoutMs: Infinity }, {})).toThrow("rerankTimeoutMs")
   expect(() => resolveConfig({ dir: "" }, {})).toThrow("dir")
   expect(() => resolveConfig({ dir: "relative/path" }, {})).toThrow("absolute")
+})
+
+test("an invalid environment value cannot prevent a plugin option from taking precedence", () => {
+  const result = Bun.spawnSync({
+    cmd: ["bun", "-e", `await import(${JSON.stringify(join(import.meta.dir, "..", "src", "index.ts"))})`],
+    env: { ...process.env, OPENCODE_MEMORY_DELAY_MS: "invalid" },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  expect(result.exitCode, result.stderr.toString()).toBe(0)
+  expect(resolveConfig({ delayMs: 25 }, { OPENCODE_MEMORY_DELAY_MS: "invalid" }).delayMs).toBe(25)
+})
+
+test("existing environment booleans keep their 1.7.0 behavior", () => {
+  const config = resolveConfig({}, { OPENCODE_MEMORY_OFF: "false", OPENCODE_MEMORY_DEBUG: "no", OPENCODE_MEMORY_RERANK: "false" })
+  expect(config.off).toBe(false)
+  expect(config.debug).toBe(false)
+  expect(config.rerank).toBe(false)
 })
