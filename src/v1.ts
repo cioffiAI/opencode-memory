@@ -290,7 +290,7 @@ TASKS:
 2. update: only entries whose fact genuinely CHANGED in the conversation (e.g. "The user changed jobs" replaces the old one). Never use update for mere reformulation.
 3. delete: ids of entries that are outdated or contradicted.
 4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit (the user says something that invalidates it, e.g. "I always use npm" vs "from now on I use Bun everywhere"), report it here with the entry id and a short evidence quote. Never modify or delete that entry — reporting is enough; the user resolves the conflict.
-5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data (credentials, tokens, passwords) in the summary.
+${CONFIG.summary ? "5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data (credentials, tokens, passwords) in the summary." : ""}
 
 SOURCE HIERARCHY (critical):
 - Entries tagged source=explicit were stated directly by the user and ALWAYS win over source=dreamed (inferred) ones.
@@ -303,14 +303,14 @@ SOURCE HIERARCHY (critical):
 RULES:
 - Do NOT invent facts; extract only what the conversation actually says.
 - Skip trivial small talk and one-off actions.
-- If nothing new, return empty arrays but still a summary ("" if no change).
+- If nothing new, return empty arrays${CONFIG.summary ? ' but still a summary ("" if no change)' : ''}.
 - Write facts in the same language the user used in the conversation.
 - Existing entries may be written in a DIFFERENT language: compare MEANING, not wording. Before adding a fact, ask yourself "does any existing entry already state this?" — if yes, it is a duplicate.
 - scope "project" ONLY for facts tied to this specific codebase; everything else "global".
 - Optionally attach "confidence" (0-1) to each new fact: how sure the conversation supports it.
 
 RESPOND WITH STRICT JSON ONLY. No markdown fences, no commentary, nothing before or after:
-{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}],"summary":"..."}
+{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}]${CONFIG.summary ? ',"summary":"..."' : ''}}
 
 CURRENT MEMORY ENTRIES:
 ${entriesBlock}
@@ -350,6 +350,7 @@ ${transcript}`
     if (!answer) throw new Error("consolidation timed out")
     const parsed = extractJson(answer)
     if (!parsed || !Array.isArray(parsed.new)) throw new Error("consolidation returned no usable JSON")
+    if (!CONFIG.summary) delete parsed.summary
 
     if (Array.isArray(parsed.new) && parsed.new.length > 0 && visible.length > 0) {
       const skip = await dedupCheck(clientRef, consSessionID, visible, parsed.new)
@@ -526,7 +527,7 @@ async function markSurfaced(ids: string[], t = now()) {
 
 async function buildMemoryBlock(client: any, sessionID: string): Promise<string | undefined> {
   const store = await getStore()
-  if (store.entries.length === 0 && !store.summary) return undefined
+  if (store.entries.length === 0 && !(CONFIG.summary && store.summary)) return undefined
   const session = await sessionInfo(client, sessionID)
   const directory = session?.directory
   const t = now()
@@ -573,7 +574,7 @@ async function buildMemoryBlock(client: any, sessionID: string): Promise<string 
   const lines: string[] = []
   lines.push("<memory>")
   lines.push("The following is long-term memory from previous conversations with this user. Use it to personalize responses and follow established preferences. If something contradicts newer information, trust the newer information.")
-  if (store.summary) {
+  if (CONFIG.summary && store.summary) {
     lines.push(`<summary>${store.summary}</summary>`)
   }
   if (surfaced.length > 0) {
@@ -671,7 +672,7 @@ return async ({ client }: { client: any }) => {
           })
           if (hits.length === 0) return "No memory entries found."
           return [
-            store.summary ? `Summary: ${store.summary}` : null,
+            CONFIG.summary && store.summary ? `Summary: ${store.summary}` : null,
             ...hits.map((e) => `- [${e.id}] (${e.scope}/${e.category}, ${e.source}) ${e.text}`),
           ]
             .filter(Boolean)
@@ -681,7 +682,7 @@ return async ({ client }: { client: any }) => {
 
       memory_write: tool({
         description:
-          "Store a durable fact about the user or the project in long-term memory so future sessions remember it (like ChatGPT's 'remember that...'). Use for preferences, constraints, personal details, project decisions, and status that should persist. If a CONFLICTED memory is rewritten here it is resolved.",
+          "Store a durable fact about the user or project. Distinct facts are kept separately; repeating the same text refreshes it and resolves any conflict. Use memory_update to correct an existing fact.",
         args: {
           fact: tool.schema.string().describe("The fact to remember, third person about the user, e.g. 'The user prefers TypeScript over JavaScript'"),
           category: tool.schema.string().optional().describe("Optional category: user, project, workflow, preferences, decisions, status, environment, other"),
@@ -710,7 +711,7 @@ return async ({ client }: { client: any }) => {
             // coexist by design. Normal writes never target local-only
             // entries; a local-only write may refresh a previous local-only
             // one (prevents duplicate accumulation without exposing them).
-            const existing = findWritableTarget(fresh.entries, text, scope, ctx.directory, 0.6, sensitivity === "local-only")
+            const existing = findWritableTarget(fresh.entries, text, scope, ctx.directory, sensitivity === "local-only")
             if (existing) {
               existing.text = text
               existing.source = "explicit"
@@ -894,7 +895,8 @@ return async ({ client }: { client: any }) => {
             out.push(`Status: conflicted ${conflicted} | superseded (tombstones) ${superseded}`)
             out.push(`Sensitivity: private ${privateCount}`)
             out.push(`Categories: ${[...catCounts.entries()].map(([c, n]) => `${c} ${n}`).join(", ")}`)
-            out.push(`Summary: ${full.summary.length} chars   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((full.summary.length + s.reduce((a, e) => a + e.text.length, 0)) / 4)} tokens`)
+            const summaryChars = CONFIG.summary ? full.summary.length : 0
+            out.push(`Summary: ${CONFIG.summary ? `${summaryChars} chars` : "disabled"}   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((summaryChars + s.reduce((a, e) => a + e.text.length, 0)) / 4)} tokens`)
             const totalSurface = [...lastSurface.values()].reduce((a, r) => a + r.length, 0)
             out.push(`Surfaced in last prompts: ${totalSurface}/${s.length}`)
             out.push("(local-only entries are never listed here; manage them via the files in the memory dir)")
@@ -1018,16 +1020,20 @@ return async ({ client }: { client: any }) => {
       }),
 
       memory_clear: tool({
-        description: "Delete stored memory. With scope='project' removes ONLY this project's memories (other projects keep theirs); scope='global' clears shared facts; no argument wipes everything including local-only entries.",
+        description: "Delete stored memory. summaryOnly=true clears just the shared summary and retains all facts; omit scope in that case. Otherwise scope='project' clears this project, scope='global' clears shared facts, and no arguments wipe everything including local-only entries.",
         args: {
           scope: tool.schema.enum(["global", "project"]).optional().describe("Only clear this scope; default clears everything"),
+          summaryOnly: tool.schema.boolean().optional().describe("Clear only the summary, retaining all facts; cannot be combined with scope"),
         },
         async execute(args, ctx) {
+          if (args.summaryOnly && args.scope) return "The summary is shared; omit scope when using summaryOnly."
           let removed = 0
           await withLock(async () => {
             const fresh = await getStore()
             const before = fresh.entries.length
-            if (args.scope === "project") {
+            if (args.summaryOnly) {
+              fresh.summary = ""
+            } else if (args.scope === "project") {
               removed = clearProjectEntries(fresh, ctx.directory)
             } else if (args.scope === "global") {
               fresh.entries = fresh.entries.filter((e) => e.scope !== "global")
@@ -1036,10 +1042,11 @@ return async ({ client }: { client: any }) => {
               fresh.entries = []
               removed = before
             }
-            if (removed) fresh.summary = ""
+            if (removed || (!args.scope && !args.summaryOnly)) fresh.summary = ""
             fresh.updatedAt = now()
             await writeStore(fresh)
           })
+          if (args.summaryOnly) return "Cleared memory summary; retained all facts."
           return removed ? `Cleared ${removed} memory entr${removed === 1 ? "y" : "ies"}.` : "Memory already empty."
         },
       }),

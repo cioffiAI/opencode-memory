@@ -43,7 +43,7 @@ single policy in `src/core.ts` (`projectVisible`, `readableEntries`,
   `memory_why`, `memory_useful`, `memory_irrelevant`, `memory_inspect`) sees
   global entries plus the CURRENT project's entries — never another
   project's.
-- `memory_write` rewrite-dedup targets only an entry in the same scope (and
+- `memory_write` refreshes identical text only in the same scope (and
   the same project). A global fact and an equivalent project fact may coexist;
   neither suppresses the other. In that project both are retrievable,
   elsewhere only the global one.
@@ -102,12 +102,18 @@ plugin, and the automatic DREAM cycle runs regardless.
 | Tool | Purpose |
 | --- | --- |
 | `memory_read` | Search facts (query / category / scope); multi-word queries match all terms; global + current project only |
-| `memory_write` | Store an explicit fact (`tier`, `ttlHours`, `pinned`, `sensitivity`) |
+| `memory_write` | Store an explicit fact; identical text refreshes it (`tier`, `ttlHours`, `pinned`, `sensitivity`) |
 | `memory_update` | Correct a fact, by `id` or match — resolves CONFLICTED entries |
-| `memory_forget` / `memory_clear` | Remove facts (scoped to what is visible in this project) |
+| `memory_forget` / `memory_clear` | Remove facts; `memory_clear({ summaryOnly: true })` clears only the shared summary |
 | `memory_why` | Audit a memory: provenance, lifecycle, score breakdown |
 | `memory_inspect` | `stats` \| `recent` \| `conflicts` \| `project` \| `surfaced` |
 | `memory_useful` / `memory_irrelevant` | Feedback on retrieval quality |
+
+`memory_write` retains distinct facts even when they share similar wording or
+are submitted together with `Promise.all`. Repeating the same text (ignoring
+case and whitespace) refreshes the existing entry; punctuation and technical
+symbols remain significant. Use `memory_update` with the entry's `id` to
+correct a fact. DREAM still checks inferred facts for semantic duplicates.
 
 `memory_read` uses its own conservative lexical search: the historical
 contiguous substring match is preserved, plus an all-terms path where every
@@ -154,7 +160,8 @@ In OpenCode V2, configure the plugin in `opencode.jsonc` with an object entry:
     "package": "@cioffi_ai/opencode-memory",
     "options": {
       "dream": false,
-      "surface": false
+      "surface": false,
+      "summary": false
     }
   }]
 }
@@ -166,7 +173,8 @@ OpenCode V1 1.18.29+ uses a package/options pair instead:
 {
   "plugin": [["@cioffi_ai/opencode-memory", {
     "dream": false,
-    "surface": false
+    "surface": false,
+    "summary": false
   }]]
 }
 ```
@@ -182,6 +190,7 @@ with the offending name instead of silently falling back.
 | `off` | `OPENCODE_MEMORY_OFF` | false | Disable the entire plugin. |
 | `dream` | `OPENCODE_MEMORY_DREAM` | true | Automatic conversation consolidation and recovery sweep. |
 | `surface` | `OPENCODE_MEMORY_SURFACE` | true | Automatic memory injection and semantic reranking. |
+| `summary` | `OPENCODE_MEMORY_SUMMARY` | true | Generate and expose the shared summary in automatic context and `memory_read`. |
 | `dir` | `OPENCODE_MEMORY_DIR` | `~/.local/share/opencode/memory` | Store, state and summary directory. |
 | `debug` | `OPENCODE_MEMORY_DEBUG` | false | Trace logging. |
 | `delayMs` | `OPENCODE_MEMORY_DELAY_MS` | 90000 | Idle debounce before DREAM. |
@@ -211,6 +220,23 @@ semantic reranking even if `OPENCODE_MEMORY_RERANK=1`. Either setting leaves the
 explicit memory tools available. `OPENCODE_MEMORY_OFF=1` disables the entire plugin.
 These switches do not prevent OpenCode itself or explicit tool calls from sending
 conversation content to the configured model provider.
+
+### Disable or clear the summary
+
+Set `summary: false` (or `OPENCODE_MEMORY_SUMMARY=0`) to hide the summary from
+automatic context and `memory_read`, and stop DREAM from generating or updating
+it. Facts remain available through the tools and, when enabled, SURFACE.
+Disabling the summary preserves it on disk, so re-enabling the option restores
+it. This option is useful when DREAM is disabled and the summary becomes stale.
+
+To erase the stored summary while keeping every fact, call:
+
+```js
+await tools.memory_clear({ summaryOnly: true })
+```
+
+The summary is shared across projects, so `summaryOnly` cannot be combined with
+`scope`. If `summary` remains enabled, a later DREAM can generate it again.
 
 ## Retrieval semantics (v1.6)
 

@@ -116,7 +116,7 @@ await instance.dispose()
 console.log("OK V1: " + actual.length + " tools registered, dispose() completed")
 
 const configuredDir = memoryDir + "/v1-configured"
-const configuredV1 = await plugin.server({ client }, { dir: configuredDir, dream: false, surface: false })
+const configuredV1 = await plugin.server({ client }, { dir: configuredDir, dream: false, surface: false, summary: false })
 await configuredV1.tool.memory_write.execute({ fact: "Configured V1 store." }, { directory: process.cwd() })
 const configuredEntries = JSON.parse(readFileSync(configuredDir + "/store.json", "utf8")).entries
 if (configuredEntries.length !== 1 || configuredEntries[0].text !== "Configured V1 store.") {
@@ -129,8 +129,25 @@ if (configuredOutput.system.length) {
   console.error("FAIL: installed V1 adapter surfaced memory despite options")
   process.exit(1)
 }
+async function verifyControls(call, dir) {
+  const facts = [
+    "The user prefers that repositories be useful and non-wordy.",
+    "The user prefers concise responses.",
+  ]
+  await Promise.all(facts.map((fact) => call("memory_write", { fact, category: "preferences" })))
+  const path = dir + "/store.json"
+  const saved = JSON.parse(readFileSync(path, "utf8"))
+  if (facts.some((fact) => !saved.entries.some((entry) => entry.text === fact))) throw new Error("packed adapter lost a parallel write")
+  saved.summary = "PACKED_STALE_SUMMARY"
+  writeFileSync(path, JSON.stringify(saved))
+  if (String(await call("memory_read", {})).includes(saved.summary)) throw new Error("packed adapter exposed disabled summary")
+  await call("memory_clear", { summaryOnly: true })
+  const cleared = JSON.parse(readFileSync(path, "utf8"))
+  if (cleared.summary !== "" || cleared.entries.length !== saved.entries.length) throw new Error("packed summary-only clear lost facts")
+}
+await verifyControls(async (name, args) => configuredV1.tool[name].execute(args, { directory: process.cwd() }), configuredDir)
 await configuredV1.dispose()
-console.log("OK V1: options select an isolated store and disable SURFACE")
+console.log("OK V1: isolated options, parallel writes, hidden summary, summary-only clear")
 
 const v2Tools = []
 const hooks = {}
@@ -141,7 +158,7 @@ const subscribe = async function* ({ signal } = {}) {
 const v2ctx = {
   app: { name: "opencode", version: "2.0.11", channel: "test" },
   location: { directory: process.cwd(), project: { id: "project", directory: process.cwd(), canonical: process.cwd() } },
-  options: {},
+  options: { dream: false, summary: false },
   tool: {
     transform: async (callback) => {
       callback({ add: (definition) => v2Tools.push(definition) })
@@ -185,6 +202,7 @@ if (!String(result.content).includes("coffee in the morning")) {
   console.error("FAIL: V2 memory_write/memory_read round trip failed", result)
   process.exit(1)
 }
+await verifyControls(async (name, args) => (await v2Tools.find((tool) => tool.name === name).execute(args, toolContext)).content, memoryDir)
 const migrated = JSON.parse(readFileSync(memoryDir + "/store.json", "utf8"))
 if (migrated.version !== 2 || migrated.entries.find((entry) => entry.id === "legacy-1")?.tier !== "core") {
   console.error("FAIL: installed package did not migrate the V1 store to V2")
@@ -197,7 +215,7 @@ if (!event.system.some((part) => part.type === "text" && part.text.includes("<me
   process.exit(1)
 }
 await cleanup?.()
-console.log("OK V2: " + v2Names.length + " tools, migration/read/write/context hook, cleanup completed")
+console.log("OK V2: " + v2Names.length + " tools, migration/read/write/context, parallel writes, summary controls, cleanup")
 `
 
 const artifactsDir = mkdtempSync(join(tmpdir(), "opencode-memory-artifacts-"))

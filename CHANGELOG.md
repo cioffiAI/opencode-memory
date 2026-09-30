@@ -5,6 +5,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `summary` plugin option and `OPENCODE_MEMORY_SUMMARY` switch to disable summary
+  generation and hide stored summaries from context and memory tools (issue #12).
+- `memory_clear({ summaryOnly: true })` erases the shared summary while retaining
+  all facts (issue #12).
+
+### Fixed
+
+- Explicit writes no longer overwrite distinct facts with similar wording,
+  including the two preferences in Jack's parallel-write example (issue #11).
+  Identical text still refreshes an entry; corrections use `memory_update`.
+- Store mutations queue across instances sharing a directory, preventing local
+  parallel calls from exhausting lock retries while retaining cross-process
+  file locking (issue #11).
+
 ## [1.7.1] — 2026-09-29
 
 ### Added

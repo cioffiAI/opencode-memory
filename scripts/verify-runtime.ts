@@ -4,6 +4,9 @@
 // OPENCODE_TEST_DISABLE_AUTO=1 also checks that DREAM and SURFACE stay off.
 // OPENCODE_TEST_CONFIG_OPTIONS=1 supplies those switches and dir through
 // opencode.jsonc, against conflicting environment values.
+// OPENCODE_TEST_DISABLE_SUMMARY=1 checks hidden context/tool output and DREAM
+// ignoring unsolicited summary output. Every run exercises parallel writes
+// and clearing the summary without deleting facts.
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -15,6 +18,8 @@ const major = process.env.OPENCODE_TEST_MAJOR ?? "2"
 if (!["1", "2"].includes(major)) throw new Error("OPENCODE_TEST_MAJOR must be 1 or 2")
 const v2 = major === "2"
 const configOptions = process.env.OPENCODE_TEST_CONFIG_OPTIONS === "1"
+const disableSummary = process.env.OPENCODE_TEST_DISABLE_SUMMARY === "1"
+const summaryMarker = "STALE_SUMMARY_RUNTIME_MARKER"
 const disableAutomatic = process.env.OPENCODE_TEST_DISABLE_AUTO === "1" || configOptions
 const root = realpathSync(mkdtempSync(join(tmpdir(), `opencode-memory-v${major}-runtime-`)))
 const project = join(root, "project")
@@ -39,12 +44,13 @@ const cliEnv = {
   OPENCODE_MEMORY_DIR: configOptions ? join(root, "wrong-memory") : memory,
   OPENCODE_MEMORY_DELAY_MS: "100",
   OPENCODE_MEMORY_SWEEP_START_MS: "600000", OPENCODE_MEMORY_DEBUG: "1",
+  OPENCODE_MEMORY_SUMMARY: configOptions || !disableSummary ? "1" : "0",
   ...(configOptions
     ? { OPENCODE_MEMORY_DREAM: "1", OPENCODE_MEMORY_SURFACE: "1" }
     : disableAutomatic ? { OPENCODE_MEMORY_DREAM: "0", OPENCODE_MEMORY_SURFACE: "0" } : {}),
 }
 const configuredPackage = configOptions
-  ? { dir: memory, dream: false, surface: false }
+  ? { dir: memory, dream: false, surface: false, summary: !disableSummary }
   : undefined
 const config = v2 ? {
   plugins: [configuredPackage ? { package: packageDir, options: configuredPackage } : packageDir], model: "memory-test/test",
@@ -62,7 +68,7 @@ const config = v2 ? {
 }
 writeFileSync(cliEnv.OPENCODE_CONFIG, JSON.stringify(config))
 // Verify existing stores survive the runtime transition, including local-only data.
-writeFileSync(join(memory, "store.json"), JSON.stringify({ version: 1, summary: "", updatedAt: 0, entries: [
+writeFileSync(join(memory, "store.json"), JSON.stringify({ version: 1, summary: summaryMarker, updatedAt: 0, entries: [
   { id: "legacy", text: "The user lives in Turin.", category: "preferences", scope: "global", weight: 3, created: Date.now(), lastSeen: Date.now(), source: "explicit" },
   { id: "private", text: "SECRET_LOCAL_ONLY_COMPAT", category: "preferences", scope: "global", sensitivity: "local-only", weight: 3, created: Date.now(), lastSeen: Date.now(), source: "explicit" },
 ] }))
@@ -112,23 +118,31 @@ try {
     ...(v2 ? { model: { providerID: "memory-test", id: "test" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] } : { permission: [{ permission: "*", pattern: "*", action: "allow" }] }),
   })
   const prefix = `${v2 ? "/api" : ""}/session/${session.id}`
-  for (const text of ["WRITE_TEST", "READ_TEST"]) {
+  async function sendAndCheck(text: string, expected: string) {
     const before = model.requests.length
     const prompt = text === "WRITE_TEST" ? `${text}: I prefer teal terminal themes.` : text
     await api(`${prefix}/${v2 ? "prompt" : "message"}`, v2 ? { text: prompt } : {
       parts: [{ type: "text", text: prompt }], model: { providerID: "memory-test", modelID: "test" },
     })
     await until(() => model.requests.slice(before).some((request) => request.messages?.some((message: any) =>
-      message.role === "tool" && JSON.stringify(message).includes(text === "WRITE_TEST" ? "Remembered" : "coffee in the morning"))), `${text} tool result`)
+      message.role === "tool" && JSON.stringify(message).includes(expected))), `${text} tool result`)
     if (v2) await until(async () => (await api(`${prefix}/context`)).at(-1)?.type === "idle", "session idle")
   }
+  await sendAndCheck("WRITE_TEST", "Remembered")
+  await sendAndCheck("READ_TEST", "coffee in the morning")
   if (disableAutomatic) {
     await Bun.sleep(500)
     if (store().entries.some((entry: any) => entry.source === "dreamed")) throw new Error("DREAM wrote while disabled")
   } else {
     await until(() => store().entries.some((entry: any) => entry.source === "dreamed" && entry.text.includes("teal terminal")), "automatic DREAM", 40_000)
   }
+  // Exercise explicit preferences after consolidation: they intentionally
+  // overlap the existing DREAM lexical dedup guard's boilerplate words.
+  await sendAndCheck("PARALLEL_TEST", "Remembered")
   const saved = store()
+  for (const fact of ["The user prefers that repositories be useful and non-wordy.", "The user prefers concise responses."]) {
+    if (!saved.entries.some((entry: any) => entry.text === fact)) throw new Error(`parallel write lost: ${fact}`)
+  }
   if (saved.version !== 2 || saved.entries.find((entry: any) => entry.id === "legacy")?.tier !== "core") throw new Error("store migration lost legacy data")
   const allRequests = JSON.stringify(model.requests)
   const injectedMemory = model.requests.some((request) => request.messages.some((message: any) =>
@@ -138,11 +152,22 @@ try {
   if (disableAutomatic && injectedMemory) throw new Error("SURFACE injected while disabled")
   if (!disableAutomatic && !injectedExplicit) throw new Error("written memory missing from model context")
   if (allRequests.includes("SECRET_LOCAL_ONLY_COMPAT")) throw new Error("local-only memory reached the model")
+  if (disableSummary && (allRequests.includes(summaryMarker) || saved.summary !== summaryMarker)) throw new Error("disabled summary leaked or was updated by DREAM")
+  if (disableSummary && model.requests.some((request) => request.messages.some((message: any) =>
+    message.role === "system" && JSON.stringify(message).includes("<summary>")))) throw new Error("disabled summary tag reached model context")
   const internal = model.requests.filter((request) => /You are (the memory consolidation module|a deduplication checker)/.test(JSON.stringify(request.messages)))
   if (disableAutomatic && internal.length) throw new Error("DREAM called the model while disabled")
   if (!disableAutomatic && (!internal.length || internal.some((request) => request.tools?.length))) throw new Error("DREAM/dedup exposed tools")
   const names = ["read", "write", "update", "why", "inspect", "useful", "irrelevant", "forget", "clear"].map((name) => `memory_${name}`)
   if (names.some((name) => !allRequests.includes(name))) throw new Error("not all nine memory tools reached the model")
+  await sendAndCheck("CLEAR_SUMMARY_TEST", "Cleared memory summary")
+  // With summary/DREAM enabled, the completion event may regenerate a summary
+  // immediately after the clear tool finishes. Disabled runs must stay empty.
+  if ((disableSummary || disableAutomatic) && store().summary !== "") throw new Error("summary-only clear left summary behind")
+  if (JSON.stringify(store().entries.map((entry: any) => entry.id).sort()) !== JSON.stringify(saved.entries.map((entry: any) => entry.id).sort())) {
+    throw new Error("summary-only clear lost facts")
+  }
+  console.log(`OK V${major}: parallel writes${v2 ? " through Code Mode Promise.all" : " through concurrent tool calls"}, summary-only clear${disableSummary ? ", summary hidden and DREAM summary disabled" : ""}`)
   console.log(disableAutomatic
     ? `OK V${major}: real CLI load, nine tools, write/read, DREAM and SURFACE disabled${configOptions ? " through opencode.jsonc" : ""}, migration, local-only privacy`
     : `OK V${major}: real CLI load, nine tools, write/read, context, DREAM, migration, local-only privacy, tool-free internal calls`)

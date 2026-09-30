@@ -218,7 +218,7 @@ export function consolidationEntries(store: Store, directory: string | undefined
   return readableEntries(store, directory)
 }
 
-// In-place rewrite target for memory_write: restricted to the SAME scope (and
+// Exact-text refresh target for memory_write: restricted to the SAME scope (and
 // same project for scope=project). A global fact and an equivalent project
 // fact may coexist by design; neither suppresses the other. Normal writes
 // never target local-only entries (they are invisible); a write that is
@@ -229,7 +229,6 @@ export function findWritableTarget(
   text: string,
   scope: Entry["scope"],
   directory: string | undefined,
-  threshold = 0.6,
   includeLocalOnly = false,
 ): Entry | undefined {
   const candidates = entries.filter(
@@ -238,7 +237,10 @@ export function findWritableTarget(
       e.scope === scope &&
       (scope === "global" || e.projectID === directory),
   )
-  return findSimilar(candidates, text, threshold)
+  // Similar wording can describe distinct facts. Only refresh exact text;
+  // preserve punctuation so technical identifiers such as C++ and C# differ.
+  const canonical = (value: string) => value.normalize("NFC").toLowerCase().replace(/\s+/g, " ").trim()
+  return candidates.find((entry) => canonical(entry.text) === canonical(text))
 }
 
 // ---------------------------------------------------------------------------
