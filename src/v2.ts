@@ -356,7 +356,7 @@ TASKS:
 2. update: only entries whose fact genuinely CHANGED in the conversation. Never use update for mere reformulation.
 3. delete: ids of entries that are outdated or contradicted.
 4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit, report it with the entry id and a short evidence quote. Never modify or delete that entry.
-5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data in the summary.
+${this.config.summary ? "5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data in the summary." : ""}
 
 SOURCE HIERARCHY:
 - Entries tagged source=explicit were stated directly by the user and ALWAYS win over source=dreamed entries.
@@ -369,14 +369,14 @@ SOURCE HIERARCHY:
 RULES:
 - Do NOT invent facts; extract only what the conversation actually says.
 - Skip trivial small talk and one-off actions.
-- If nothing is new, return empty arrays but still a summary (or "" if unchanged).
+- If nothing is new, return empty arrays${this.config.summary ? ' but still a summary (or "" if unchanged)' : ''}.
 - Write facts in the same language the user used.
 - Compare meaning across languages before adding a fact.
 - Use scope "project" only for facts tied to this codebase; otherwise use "global".
 - Optionally attach confidence (0-1) to each new fact.
 
 RESPOND WITH STRICT JSON ONLY:
-{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}],"summary":"..."}
+{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}]${this.config.summary ? ',"summary":"..."' : ''}}
 
 CURRENT MEMORY ENTRIES:
 ${entriesBlock}
@@ -392,6 +392,7 @@ ${transcript}`
       if (!answer) throw new Error("consolidation timed out")
       const parsed = extractJson(answer)
       if (!parsed || !Array.isArray(parsed.new)) throw new Error("consolidation returned no usable JSON")
+      if (!this.config.summary) delete parsed.summary
 
       if (parsed.new.length > 0 && visible.length > 0) {
         const skip = await this.dedupCheck(session, visible, parsed.new)
@@ -502,7 +503,7 @@ ${lines}`
 
   private async buildMemoryBlock(sessionID: string): Promise<string | undefined> {
     const store = await this.store.getStore()
-    if (store.entries.length === 0 && !store.summary) return undefined
+    if (store.entries.length === 0 && !(this.config.summary && store.summary)) return undefined
     const session = await this.sessionInfo(sessionID)
     if (!session) return undefined
     const directory = session.location.directory
@@ -536,7 +537,7 @@ ${lines}`
       "<memory>",
       "The following is long-term memory from previous conversations with this user. Use it to personalize responses and follow established preferences. If something contradicts newer information, trust the newer information.",
     ]
-    if (store.summary) lines.push(`<summary>${store.summary}</summary>`)
+    if (this.config.summary && store.summary) lines.push(`<summary>${store.summary}</summary>`)
     if (surfaced.length > 0) {
       lines.push("<facts>")
       for (const candidate of surfaced) {
@@ -589,14 +590,14 @@ ${lines}`
           })
           if (hits.length === 0) return "No memory entries found."
           return [
-            store.summary ? `Summary: ${store.summary}` : null,
+            this.config.summary && store.summary ? `Summary: ${store.summary}` : null,
             ...hits.map((entry) => `- [${entry.id}] (${entry.scope}/${entry.category}, ${entry.source}) ${entry.text}`),
           ].filter(Boolean).join("\n")
         },
       },
       {
         name: "memory_write",
-        description: "Store a durable fact about the user or project. Rewriting a conflicted memory resolves it.",
+        description: "Store a durable fact about the user or project. Distinct facts are kept separately; repeating the same text refreshes it and resolves any conflict. Use memory_update to correct an existing fact.",
         input: objectSchema({
           fact: { type: "string", description: "The fact to remember, written in third person" },
           category: { type: "string", description: categoryDescription },
@@ -617,7 +618,7 @@ ${lines}`
           let status = ""
           await this.store.withLock(async () => {
             const fresh = await this.store.getStore()
-            const existing = findWritableTarget(fresh.entries, text, scope, directory, 0.6, sensitivity === "local-only")
+            const existing = findWritableTarget(fresh.entries, text, scope, directory, sensitivity === "local-only")
             if (existing) {
               existing.text = text
               existing.source = "explicit"
@@ -777,7 +778,8 @@ ${lines}`
             output.push(`Status: conflicted ${count((entry) => entry.status === "CONFLICTED")} | superseded ${count((entry) => entry.status === "SUPERSEDED")}`)
             output.push(`Sensitivity: private ${count((entry) => entry.sensitivity === "private")}`)
             output.push(`Categories: ${[...categories.entries()].map(([category, total]) => `${category} ${total}`).join(", ")}`)
-            output.push(`Summary: ${store.summary.length} chars   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((store.summary.length + visible.reduce((sum, entry) => sum + entry.text.length, 0)) / 4)} tokens`)
+            const summaryChars = this.config.summary ? store.summary.length : 0
+            output.push(`Summary: ${this.config.summary ? `${summaryChars} chars` : "disabled"}   Avg fact: ${avgChars} chars   Est. full context cost: ${Math.round((summaryChars + visible.reduce((sum, entry) => sum + entry.text.length, 0)) / 4)} tokens`)
             output.push(`Surfaced in last prompts: ${[...this.lastSurface.values()].reduce((sum, ranked) => sum + ranked.length, 0)}/${visible.length}`)
             output.push("(local-only entries are never listed here; manage them via files in the memory dir)")
           } else if (show === "recent") {
@@ -886,15 +888,21 @@ ${lines}`
       },
       {
         name: "memory_clear",
-        description: "Delete stored memory. Project scope only clears this project; global clears shared facts; no scope wipes everything including local-only entries.",
-        input: objectSchema({ scope: { type: "string", enum: ["global", "project"], description: "Only clear this scope; default clears everything" } }),
+        description: "Delete stored memory. summaryOnly=true clears just the shared summary and retains all facts; omit scope in that case. Otherwise project scope clears this project, global clears shared facts, and no arguments wipe everything including local-only entries.",
+        input: objectSchema({
+          scope: { type: "string", enum: ["global", "project"], description: "Only clear this scope; default clears everything" },
+          summaryOnly: { type: "boolean", description: "Clear only the summary, retaining all facts; cannot be combined with scope" },
+        }),
         execute: async (args, context) => {
+          if (args.summaryOnly && args.scope) return "The summary is shared; omit scope when using summaryOnly."
           const directory = await this.directoryFor(context.sessionID)
           let removed = 0
           await this.store.withLock(async () => {
             const fresh = await this.store.getStore()
             const before = fresh.entries.length
-            if (args.scope === "project") {
+            if (args.summaryOnly) {
+              fresh.summary = ""
+            } else if (args.scope === "project") {
               removed = clearProjectEntries(fresh, directory)
             } else if (args.scope === "global") {
               fresh.entries = fresh.entries.filter((entry) => entry.scope !== "global")
@@ -903,10 +911,11 @@ ${lines}`
               fresh.entries = []
               removed = before
             }
-            if (removed) fresh.summary = ""
+            if (removed || (!args.scope && !args.summaryOnly)) fresh.summary = ""
             fresh.updatedAt = now()
             await this.store.writeStore(fresh)
           })
+          if (args.summaryOnly) return "Cleared memory summary; retained all facts."
           return removed ? `Cleared ${removed} memory entr${removed === 1 ? "y" : "ies"}.` : "Memory already empty."
         },
       },

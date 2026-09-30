@@ -6,6 +6,7 @@ test("plugin options override environment values and preserve defaults", () => {
   const config = resolveConfig({
     dream: false,
     surface: false,
+    summary: false,
     dir: "/tmp/memory-from-config",
     delayMs: 25,
     rerank: true,
@@ -13,12 +14,14 @@ test("plugin options override environment values and preserve defaults", () => {
   }, {
     OPENCODE_MEMORY_DREAM: "1",
     OPENCODE_MEMORY_SURFACE: "1",
+    OPENCODE_MEMORY_SUMMARY: "1",
     OPENCODE_MEMORY_DIR: "/tmp/memory-from-env",
     OPENCODE_MEMORY_DELAY_MS: "90",
     OPENCODE_MEMORY_MAX_FACTS: "7",
   })
   expect(config.dream).toBe(false)
   expect(config.surface).toBe(false)
+  expect(config.summary).toBe(false)
   expect(config.dir).toBe("/tmp/memory-from-config")
   expect(config.delayMs).toBe(25)
   expect(config.maxFacts).toBe(7)
@@ -29,7 +32,7 @@ test("plugin options override environment values and preserve defaults", () => {
 
 test("every environment setting can be supplied through plugin options", () => {
   const options = {
-    off: true, dream: false, surface: false, dir: "/tmp/memory-all-options",
+    off: true, dream: false, surface: false, summary: false, dir: "/tmp/memory-all-options",
     debug: true, delayMs: 0, maxEntries: 1, maxFacts: 0, maxChars: 1,
     transcriptChars: 1, sweepIntervalMs: 1, sweepStartMs: 0, sweepBatch: 1,
     gcChildAgeMs: 0, inProgressTimeoutMs: 1, rerank: true,
@@ -42,10 +45,18 @@ test("every environment setting can be supplied through plugin options", () => {
 test("invalid options fail at setup with the offending name", () => {
   expect(() => resolveConfig({ dreem: false }, {})).toThrow("dreem")
   expect(() => resolveConfig({ dream: "false" }, {})).toThrow("dream")
+  expect(() => resolveConfig({ summary: "false" }, {})).toThrow("summary")
   expect(() => resolveConfig({ delayMs: -1 }, {})).toThrow("delayMs")
   expect(() => resolveConfig({ rerankTimeoutMs: Infinity }, {})).toThrow("rerankTimeoutMs")
   expect(() => resolveConfig({ dir: "" }, {})).toThrow("dir")
   expect(() => resolveConfig({ dir: "relative/path" }, {})).toThrow("absolute")
+})
+
+test("summary is enabled by default and accepts a strict environment switch", () => {
+  expect(resolveConfig({}, {}).summary).toBe(true)
+  expect(resolveConfig({}, { OPENCODE_MEMORY_SUMMARY: "0" }).summary).toBe(false)
+  expect(() => resolveConfig({}, { OPENCODE_MEMORY_SUMMARY: "false" })).toThrow("summary")
+  expect(resolveConfig({ summary: false }, { OPENCODE_MEMORY_SUMMARY: "invalid" }).summary).toBe(false)
 })
 
 test("an invalid environment value cannot prevent a plugin option from taking precedence", () => {

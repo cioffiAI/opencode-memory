@@ -23,18 +23,28 @@ export function startMockModel() {
         const lastUser = messages.findLastIndex((message: any) => message.role === "user")
         const prompt = JSON.stringify(messages[lastUser] ?? "")
         const done = messages.slice(lastUser + 1).some((message: any) => message.role === "tool")
-        const name = prompt.includes("WRITE_TEST") ? "memory_write" : prompt.includes("READ_TEST") ? "memory_read" : undefined
+        const parallel = prompt.includes("PARALLEL_TEST")
+        const name = prompt.includes("WRITE_TEST") || parallel ? "memory_write"
+          : prompt.includes("READ_TEST") ? "memory_read" : prompt.includes("CLEAR_SUMMARY_TEST") ? "memory_clear" : undefined
         if (!done && name) {
           const args = name === "memory_write"
             ? { fact: "The user drinks coffee in the morning.", category: "preferences", scope: "global" }
-            : { query: "coffee morning" }
+            : name === "memory_clear" ? { summaryOnly: true } : { query: "coffee morning" }
+          const parallelArgs = [
+            { fact: "The user prefers that repositories be useful and non-wordy.", category: "preferences" },
+            { fact: "The user prefers concise responses.", category: "preferences" },
+          ]
           // V2 exposes plugin tools through Code Mode by default. Use only the
           // advertised path; V1 exposes the same tools directly.
           const direct = body.tools?.some((tool: any) => tool.function?.name === name)
           if (!direct && !joined.includes(`tools.${name}(`)) throw new Error(`${name} missing from model tool catalog`)
-          calls = [{ index: 0, id: `call_${name}`, type: "function", function: {
+          calls = parallel && direct ? parallelArgs.map((args, index) => ({
+            index, id: `call_parallel_${index}`, type: "function", function: { name, arguments: JSON.stringify(args) },
+          })) : [{ index: 0, id: `call_${name}`, type: "function", function: {
             name: direct ? name : "execute",
-            arguments: JSON.stringify(direct ? args : { code: `return await tools.${name}(${JSON.stringify(args)})` }),
+            arguments: JSON.stringify(direct ? args : { code: parallel
+              ? `return await Promise.all([${parallelArgs.map((args) => `tools.memory_write(${JSON.stringify(args)})`).join(",")}])`
+              : `return await tools.${name}(${JSON.stringify(args)})` }),
           } }]
         }
       }

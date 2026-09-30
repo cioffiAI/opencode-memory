@@ -14,6 +14,7 @@ function runV2Check(extraEnv: Record<string, string> = {}) {
         OPENCODE_MEMORY_DIR: memoryDir,
         OPENCODE_MEMORY_DREAM: "1",
         OPENCODE_MEMORY_SURFACE: "1",
+        OPENCODE_MEMORY_SUMMARY: "1",
         OPENCODE_MEMORY_DELAY_MS: "0",
         OPENCODE_MEMORY_SWEEP_START_MS: "600000",
         OPENCODE_MEMORY_SWEEP_MS: "600000",
@@ -45,6 +46,10 @@ test("V2 setup rolls back tool registration if context hook registration fails",
 
 test("V2 can disable DREAM while keeping explicit tools and SURFACE", () => {
   runV2Check({ OPENCODE_MEMORY_DREAM: "0", V2_CHECK_DREAM_DISABLED: "1" })
+})
+
+test("V2 DREAM omits a disabled summary and ignores an unsolicited model summary", () => {
+  runV2Check({ OPENCODE_MEMORY_SUMMARY: "0" })
 })
 
 test("V2 can disable SURFACE while keeping DREAM and explicit tools", () => {

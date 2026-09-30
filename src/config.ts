@@ -14,6 +14,7 @@ const OPTION_ENV = {
   off: "OPENCODE_MEMORY_OFF",
   dream: "OPENCODE_MEMORY_DREAM",
   surface: "OPENCODE_MEMORY_SURFACE",
+  summary: "OPENCODE_MEMORY_SUMMARY",
   dir: "OPENCODE_MEMORY_DIR",
   debug: "OPENCODE_MEMORY_DEBUG",
   delayMs: "OPENCODE_MEMORY_DELAY_MS",
@@ -38,6 +39,7 @@ export type MemoryConfig = {
   off: boolean
   dream: boolean
   surface: boolean
+  summary: boolean
   dir: string
   debug: boolean
   delayMs: number
@@ -106,6 +108,7 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     off: boolean("off", false),
     dream: boolean("dream", true),
     surface: boolean("surface", true),
+    summary: boolean("summary", true),
     dir: path.resolve(expandedDir),
     debug: boolean("debug", false),
     delayMs: integer("delayMs", 90000, 0),

@@ -47,29 +47,45 @@ export type State = {
   inProgress?: Record<string, InProgress>
 }
 
+// Share a queue across instances using the same directory. The filesystem
+// lock still protects against other processes; local callers wait their turn
+// without consuming the cross-process lock timeout.
+const lockQueues = new Map<string, Promise<void>>()
+
 export function createStore(dataDir: string) {
+  dataDir = path.resolve(dataDir)
   const lockFile = path.join(dataDir, ".lock")
   const storeFile = path.join(dataDir, "store.json")
   const stateFile = path.join(dataDir, "state.json")
   const summaryFile = path.join(dataDir, "SUMMARY.md")
 
   async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-    await mkdir(dataDir, { recursive: true }).catch(() => {})
-    let fd: Awaited<ReturnType<typeof open>> | undefined
-    for (let i = 0; i < 40; i++) {
-      try {
-        fd = await open(lockFile, "wx")
-        break
-      } catch {
-        await sleep(50)
-      }
-    }
-    if (!fd) throw new Error("memory store lock timeout")
+    const previous = lockQueues.get(lockFile) ?? Promise.resolve()
+    let release!: () => void
+    const turn = new Promise<void>((resolve) => { release = resolve })
+    lockQueues.set(lockFile, turn)
+    await previous
     try {
-      return await fn()
+      await mkdir(dataDir, { recursive: true }).catch(() => {})
+      let fd: Awaited<ReturnType<typeof open>> | undefined
+      for (let i = 0; i < 40; i++) {
+        try {
+          fd = await open(lockFile, "wx")
+          break
+        } catch {
+          await sleep(50)
+        }
+      }
+      if (!fd) throw new Error("memory store lock timeout")
+      try {
+        return await fn()
+      } finally {
+        await fd.close().catch(() => {})
+        await unlink(lockFile).catch(() => {})
+      }
     } finally {
-      await fd.close().catch(() => {})
-      await unlink(lockFile).catch(() => {})
+      release()
+      if (lockQueues.get(lockFile) === turn) lockQueues.delete(lockFile)
     }
   }
 

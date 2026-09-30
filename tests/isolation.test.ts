@@ -130,8 +130,16 @@ describe("findWritableTarget (memory_write dedup targeting)", () => {
   test("a local-only write MAY refresh a previous local-only entry (no duplicate accumulation)", () => {
     const store = storeWith([entry({ id: "lo", text: "The user's SMTP password is hunter2.", sensitivity: "local-only" })])
     expect(
-      findWritableTarget(store.entries, "The user's SMTP password is now CorrectHorse.", "global", undefined, 0.6, true)?.id,
+      findWritableTarget(store.entries, "The user's SMTP password is hunter2.", "global", undefined, true)?.id,
     ).toBe("lo")
+    expect(findWritableTarget(store.entries, "The user's SMTP password is now CorrectHorse.", "global", undefined, true)).toBeUndefined()
+  })
+
+  test("only exact text refreshes a fact, preserving symbols and normalizing case/spacing", () => {
+    const store = storeWith([entry({ id: "cpp", text: "The user uses C++." })])
+    expect(findWritableTarget(store.entries, " THE USER   uses C++. ", "global", undefined)?.id).toBe("cpp")
+    expect(findWritableTarget(store.entries, "The user uses C#.", "global", undefined)).toBeUndefined()
+    expect(findWritableTarget(store.entries, "The user uses C++ and Rust.", "global", undefined)).toBeUndefined()
   })
 })
 

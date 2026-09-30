@@ -13,6 +13,7 @@ const disposed = []
 const failSetup = process.env.V2_CHECK_FAIL_SETUP === "1"
 const dreamDisabled = process.env.V2_CHECK_DREAM_DISABLED === "1"
 const surfaceDisabled = process.env.V2_CHECK_SURFACE_DISABLED === "1"
+const summaryDisabled = process.env.OPENCODE_MEMORY_SUMMARY === "0"
 const eventType = process.env.V2_CHECK_EVENT ?? "session.execution.succeeded"
 
 const contextMessages = [
@@ -75,8 +76,9 @@ const ctx = {
     },
   },
   generate: {
-    text: async () => {
+    text: async (input) => {
       generateCalls++
+      if (summaryDisabled && JSON.stringify(input).includes('"summary"')) throw new Error("disabled summary requested by DREAM")
       return {
         text: JSON.stringify({
           new: [{ text: "The user prefers teal terminal themes.", category: "preferences", scope: "global", confidence: 0.95 }],
@@ -143,6 +145,8 @@ if (dreamDisabled) {
     throw new Error(`${sweepOnly ? "recovery sweep" : "session.idle"} did not run V2 DREAM consolidation`)
   }
   if (generateCalls !== 1) throw new Error(`expected one tool-free generate call, got ${generateCalls}`)
+  if (summaryDisabled && store.summary) throw new Error("DREAM stored a summary while disabled")
+  if (!summaryDisabled && !store.summary) throw new Error("enabled DREAM did not store its summary")
 }
 
 const toolContext = {
